@@ -23,7 +23,8 @@
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica
 
 // --- Temporização ---
-#define DEEP_SLEEP_SECONDS  600   // Intervalo entre medições (em segundos). Ex: 60 = 1 min, 600 = 10 min
+#define DEEP_SLEEP_SECONDS          60    // Intervalo de acordar (segundos). 60 = 1 min
+#define SAMPLES_PER_API_UPLOAD      10   // Amostras por janela antes do envio à API (60s × 10 = 10 min)
 #define HTTP_TIMEOUT_MS     10000
 #define HTTP_MAX_RETRIES    3
 #define WIFI_TIMEOUT_MS     20000

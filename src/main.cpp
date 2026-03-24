@@ -9,9 +9,34 @@
 
 #include "config.h"
 
+#ifndef SAMPLES_PER_API_UPLOAD
+#define SAMPLES_PER_API_UPLOAD 10
+#endif
+
 #define ADC_MAX 4095  // ESP32 ADC 12-bit
+#define RTC_MAGIC 0x4D455448  // "METH" meteo
+
+RTC_DATA_ATTR uint32_t rtc_magic;
+RTC_DATA_ATTR float rtc_sum_temp;
+RTC_DATA_ATTR float rtc_sum_hum;
+RTC_DATA_ATTR float rtc_sum_press;
+RTC_DATA_ATTR float rtc_sum_precip;
+RTC_DATA_ATTR uint8_t rtc_sample_count;
+RTC_DATA_ATTR int16_t rtc_rain_first_raw;
+RTC_DATA_ATTR bool rtc_rain_all_equal;
 
 Adafruit_BME280 bme;
+
+void resetRtcWindow() {
+  rtc_magic = RTC_MAGIC;
+  rtc_sum_temp = 0.0F;
+  rtc_sum_hum = 0.0F;
+  rtc_sum_press = 0.0F;
+  rtc_sum_precip = 0.0F;
+  rtc_sample_count = 0;
+  rtc_rain_first_raw = -1;
+  rtc_rain_all_equal = true;
+}
 
 void enterDeepSleep() {
   WiFi.disconnect(true);
@@ -77,23 +102,52 @@ void runCycle() {
   float pressureSeaLevel = pressureLocal / pow(1.0 - (ALTITUDE_LOCAL / 44330.0), 5.255);
 
   int rainRaw = analogRead(RAIN_SENSOR_PIN);
-  float precipitacao = (float)(ADC_MAX - rainRaw);  // Invertido: maior = mais chuva
+  float precipSample = (float)(ADC_MAX - rainRaw);  // Invertido: maior = mais chuva
 
-  Serial.printf("Temperatura: %.2f C | Umidade: %.2f%% | Pressao: %.2f hPa | Chuva: %.1f%%\n",
-               temperature, humidity, pressureSeaLevel, precipitacao);
+  if (rtc_rain_first_raw < 0) {
+    rtc_rain_first_raw = (int16_t)rainRaw;
+  } else if (rainRaw != rtc_rain_first_raw) {
+    rtc_rain_all_equal = false;
+  }
+
+  rtc_sum_temp += temperature;
+  rtc_sum_hum += humidity;
+  rtc_sum_press += pressureSeaLevel;
+  rtc_sum_precip += precipSample;
+  rtc_sample_count++;
+
+  Serial.printf("[%d/%d] T:%.2f U:%.2f P:%.2f Chuva:%d\n",
+                rtc_sample_count, (int)SAMPLES_PER_API_UPLOAD,
+                temperature, humidity, pressureSeaLevel, rainRaw);
+
+  if (rtc_sample_count < SAMPLES_PER_API_UPLOAD) {
+    float avgT = rtc_sum_temp / rtc_sample_count;
+    Serial.printf("Media parcial T:%.2f U:%.2f P:%.2f\n", avgT,
+                  rtc_sum_hum / rtc_sample_count, rtc_sum_press / rtc_sample_count);
+    return;
+  }
+
+  float avgTemp = rtc_sum_temp / SAMPLES_PER_API_UPLOAD;
+  float avgHum = rtc_sum_hum / SAMPLES_PER_API_UPLOAD;
+  float avgPress = rtc_sum_press / SAMPLES_PER_API_UPLOAD;
+  float precipitacao = rtc_rain_all_equal ? 0.0F : (rtc_sum_precip / SAMPLES_PER_API_UPLOAD);
+
+  Serial.printf("Medias finais: T:%.2f U:%.2f P:%.2f Precip:%.2f (chuva_igual=%d)\n",
+                avgTemp, avgHum, avgPress, precipitacao, rtc_rain_all_equal);
 
   if (!connectWiFi()) {
     Serial.printf("Falha ao conectar WiFi.\n");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+    resetRtcWindow();
     return;
   }
   Serial.printf("WiFi conectado.\n");
 
   JsonDocument doc;
-  doc["temperatura"] = round(temperature * 100) / 100.0;
-  doc["umidade"] = round(humidity * 100) / 100.0;
-  doc["pressao"] = round(pressureSeaLevel * 100) / 100.0;
+  doc["temperatura"] = round(avgTemp * 100) / 100.0;
+  doc["umidade"] = round(avgHum * 100) / 100.0;
+  doc["pressao"] = round(avgPress * 100) / 100.0;
   doc["precipitacao"] = round(precipitacao * 100) / 100.0;
 
   String payload;
@@ -118,6 +172,7 @@ void runCycle() {
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  resetRtcWindow();
 }
 
 void setup() {
@@ -144,6 +199,10 @@ void setup() {
                   Adafruit_BME280::SAMPLING_X1,
                   Adafruit_BME280::FILTER_OFF,
                   Adafruit_BME280::STANDBY_MS_0_5);
+
+  if (rtc_magic != RTC_MAGIC) {
+    resetRtcWindow();
+  }
 
   runCycle();
 
