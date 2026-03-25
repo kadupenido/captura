@@ -35,7 +35,7 @@ cp include/config.example.h include/config.h
 - `WIFI_SSID` e `WIFI_PASSWORD` — rede Wi-Fi
 - `API_BASE_URL` — URL base da API (ex: `https://tempo.exemplo.com/api`)
 - `API_TOKEN` — token de autenticação Bearer (deve corresponder ao token configurado na API)
-- `ALTITUDE_LOCAL` — altitude em metros para correção barométrica da pressão
+- `ALTITUDE_LOCAL` — altitude em metros; a pressão ao nível do mar usa redução barométrica isotérmica com a temperatura medida no ciclo (`P_nm = P_local · exp(g·h/(R·T_K))`)
 - `DEEP_SLEEP_SECONDS` — intervalo entre acordes (60 = 1 min)
 - `SAMPLES_PER_API_UPLOAD` — amostras por janela antes do envio (10 = envio a cada 10 min)
 

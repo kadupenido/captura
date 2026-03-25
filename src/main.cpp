@@ -23,9 +23,9 @@
 #define ADC_MAX 4095  // ESP32 ADC 12-bit
 #define RTC_MAGIC 0x4D455448  // "METH" meteo
 
-// Fator barometrico para altitude fixa (evita pow() a cada amostra).
-static const float kPressureSealevelFactor =
-    1.0f / powf(1.0f - (ALTITUDE_LOCAL / 44330.0f), 5.255f);
+// Reducao barometrica isotermica: P_nm = P_local * exp(g*h/(R*T_K)), T_K = temperatura medida.
+static constexpr float kGravity = 9.80665f;
+static constexpr float kGasConstantDryAir = 287.05f;
 
 RTC_DATA_ATTR uint32_t rtc_magic;
 RTC_DATA_ATTR float rtc_sum_temp;
@@ -150,7 +150,9 @@ void runCycle() {
     return;
   }
 
-  float pressureSeaLevel = pressureLocal * kPressureSealevelFactor;
+  float tKelvin = temperature + 273.15f;
+  float pressureSeaLevel =
+      pressureLocal * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
 
   int rainRaw = analogRead(RAIN_SENSOR_PIN);
   float precipSample = (float)(ADC_MAX - rainRaw);  // Invertido: maior = mais chuva
