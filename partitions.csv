@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Flash min 4MB: app ~3.5MB + LittleFS ~896KB (subtype spiffs no core Arduino-ESP32)
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x370000,
+spiffs,   data, spiffs,  0x380000,0x80000

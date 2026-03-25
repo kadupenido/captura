@@ -3,18 +3,29 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <cmath>
+#include <cstdio>
 #include <esp_sleep.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 
 #include "config.h"
+#include "pending_queue.h"
 
 #ifndef SAMPLES_PER_API_UPLOAD
 #define SAMPLES_PER_API_UPLOAD 10
 #endif
 
+#ifndef PENDING_FLUSH_MAX_PER_WAKE
+#define PENDING_FLUSH_MAX_PER_WAKE 10
+#endif
+
 #define ADC_MAX 4095  // ESP32 ADC 12-bit
 #define RTC_MAGIC 0x4D455448  // "METH" meteo
+
+// Fator barometrico para altitude fixa (evita pow() a cada amostra).
+static const float kPressureSealevelFactor =
+    1.0f / powf(1.0f - (ALTITUDE_LOCAL / 44330.0f), 5.255f);
 
 RTC_DATA_ATTR uint32_t rtc_magic;
 RTC_DATA_ATTR float rtc_sum_temp;
@@ -26,6 +37,8 @@ RTC_DATA_ATTR int16_t rtc_rain_first_raw;
 RTC_DATA_ATTR bool rtc_rain_all_equal;
 
 Adafruit_BME280 bme;
+
+static bool s_littlefsOk = false;
 
 void resetRtcWindow() {
   rtc_magic = RTC_MAGIC;
@@ -72,20 +85,57 @@ bool connectWiFi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-int sendData(const String& payload) {
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+  return connectWiFi();
+}
+
+void wifiOffIfConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+}
+
+int sendData(const char* payload, size_t payloadLen) {
+  char url[192];
+  snprintf(url, sizeof(url), "%s/dados", API_BASE_URL);
   HTTPClient http;
-  String url = String(API_BASE_URL) + "/dados";
   http.begin(url);
   http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " API_TOKEN);
 
-  int code = http.POST(payload);
+  // HTTPClient::POST exige ponteiro mutavel; o buffer nao e alterado pelo cliente.
+  int code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(payload)), payloadLen);
   if (code != 201) {
     Serial.printf("Erro HTTP %d: %s\n", code, http.getString().c_str());
   }
   http.end();
   return code;
+}
+
+int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
+  int lastCode = -1;
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+    Serial.printf("Envio tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
+    lastCode = sendData(payload, payloadLen);
+    if (lastCode == 201) {
+      Serial.printf("Dados enviados com sucesso.\n");
+      return 201;
+    }
+    if (attempt < HTTP_MAX_RETRIES) {
+      delay(2000);
+    }
+  }
+  return lastCode;
+}
+
+// Ponte para PendingSendFn (linhas lidas como String na fila).
+int sendPayloadWithRetriesForQueue(const String& payload) {
+  return sendPayloadWithRetries(payload.c_str(), payload.length());
 }
 
 void runCycle() {
@@ -96,10 +146,11 @@ void runCycle() {
 
   if (isnan(temperature) || isnan(humidity) || isnan(pressureLocal)) {
     Serial.printf("Leitura invalida do BME280 (NaN).\n");
+    wifiOffIfConnected();
     return;
   }
 
-  float pressureSeaLevel = pressureLocal / pow(1.0 - (ALTITUDE_LOCAL / 44330.0), 5.255);
+  float pressureSeaLevel = pressureLocal * kPressureSealevelFactor;
 
   int rainRaw = analogRead(RAIN_SENSOR_PIN);
   float precipSample = (float)(ADC_MAX - rainRaw);  // Invertido: maior = mais chuva
@@ -124,6 +175,7 @@ void runCycle() {
     float avgT = rtc_sum_temp / rtc_sample_count;
     Serial.printf("Media parcial T:%.2f U:%.2f P:%.2f\n", avgT,
                   rtc_sum_hum / rtc_sample_count, rtc_sum_press / rtc_sample_count);
+    wifiOffIfConnected();
     return;
   }
 
@@ -135,43 +187,44 @@ void runCycle() {
   Serial.printf("Medias finais: T:%.2f U:%.2f P:%.2f Precip:%.2f (chuva_igual=%d)\n",
                 avgTemp, avgHum, avgPress, precipitacao, rtc_rain_all_equal);
 
-  if (!connectWiFi()) {
-    Serial.printf("Falha ao conectar WiFi.\n");
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    resetRtcWindow();
-    return;
-  }
-  Serial.printf("WiFi conectado.\n");
-
   JsonDocument doc;
   doc["temperatura"] = round(avgTemp * 100) / 100.0;
   doc["umidade"] = round(avgHum * 100) / 100.0;
   doc["pressao"] = round(avgPress * 100) / 100.0;
   doc["precipitacao"] = round(precipitacao * 100) / 100.0;
 
-  String payload;
-  serializeJson(doc, payload);
+  char payload[192];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  if (n == 0 || n >= sizeof(payload)) {
+    Serial.printf("Erro: JSON excede buffer ou serializacao falhou.\n");
+    wifiOffIfConnected();
+    resetRtcWindow();
+    return;
+  }
 
-  bool success = false;
-  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
-    Serial.printf("Envio tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
-    if (sendData(payload) == 201) {
-      Serial.printf("Dados enviados com sucesso.\n");
-      success = true;
-      break;
+  if (!ensureWiFi()) {
+    Serial.printf("Falha ao conectar WiFi; gravando na fila local.\n");
+    if (s_littlefsOk && !pendingQueueAppend(payload)) {
+      Serial.printf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+    } else if (!s_littlefsOk) {
+      Serial.printf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
-    if (attempt < HTTP_MAX_RETRIES) {
-      delay(2000);
+    wifiOffIfConnected();
+    resetRtcWindow();
+    return;
+  }
+  Serial.printf("WiFi conectado.\n");
+
+  if (sendPayloadWithRetries(payload, n) != 201) {
+    Serial.printf("Falha ao enviar dados apos todas as tentativas; gravando na fila local.\n");
+    if (s_littlefsOk && !pendingQueueAppend(payload)) {
+      Serial.printf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+    } else if (!s_littlefsOk) {
+      Serial.printf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
   }
 
-  if (!success) {
-    Serial.printf("Falha ao enviar dados apos todas as tentativas.\n");
-  }
-
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  wifiOffIfConnected();
   resetRtcWindow();
 }
 
@@ -184,6 +237,11 @@ void setup() {
   }
   if (Serial) delay(100);  // buffer do host pronto
   Serial.printf("Acordando...\n");
+
+  // Faixa ~0–3,3 V no ADC; ajuste se o divisor do sensor de chuva for diferente.
+  analogSetPinAttenuation(RAIN_SENSOR_PIN, ADC_11db);
+
+  s_littlefsOk = pendingQueueInit();
 
   Wire.begin(SDA_PIN, SCL_PIN);
 
@@ -202,6 +260,20 @@ void setup() {
 
   if (rtc_magic != RTC_MAGIC) {
     resetRtcWindow();
+  }
+
+  if (!s_littlefsOk) {
+    Serial.printf("Aviso: fila offline indisponivel (LittleFS).\n");
+  } else if (pendingQueueHasPending()) {
+    if (ensureWiFi()) {
+      int n = pendingQueueFlush(PENDING_FLUSH_MAX_PER_WAKE, sendPayloadWithRetriesForQueue);
+      if (n > 0) {
+        Serial.printf("Fila: enviados %d registro(s) pendente(s).\n", n);
+      }
+    } else {
+      Serial.printf("Fila: WiFi indisponivel; pendencias permanecem na flash.\n");
+      wifiOffIfConnected();
+    }
   }
 
   runCycle();
