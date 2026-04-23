@@ -33,6 +33,8 @@
 #define HTTP_TIMEOUT_MS     10000
 #define HTTP_MAX_RETRIES    3
 #define WIFI_TIMEOUT_MS     20000
+// Tempo maximo de espera pelo host USB-CDC em boot a frio (ms). 0 desabilita.
+#define COLD_BOOT_USB_WAIT_MS       2000
 
 // --- Fila offline (LittleFS) ---
 // Maximo de POSTs por acordar ao drenar a fila (evita WiFi ligado demais).

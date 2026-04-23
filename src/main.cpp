@@ -20,6 +20,10 @@
 #define PENDING_FLUSH_MAX_PER_WAKE 10
 #endif
 
+#ifndef COLD_BOOT_USB_WAIT_MS
+#define COLD_BOOT_USB_WAIT_MS 2000
+#endif
+
 #define ADC_MAX 4095  // ESP32 ADC 12-bit
 #define RTC_MAGIC 0x4D455448  // "METH" meteo
 
@@ -232,13 +236,24 @@ void runCycle() {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  // Aguarda até 10 segundos para o host USB conectar (evita perder primeiras mensagens)
-  for (int i = 0; i < 100 && !Serial; i++) {
-    delay(100);
+
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  const bool coldBoot = (wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED);
+
+  // Boot a frio: espera breve pelo host USB-CDC para nao perder logs iniciais.
+  // Wake de timer (campo): sem espera — evita ~10 s de CPU ativa a cada acordar.
+  if (coldBoot && COLD_BOOT_USB_WAIT_MS > 0) {
+    uint32_t waited = 0;
+    while (!Serial && waited < static_cast<uint32_t>(COLD_BOOT_USB_WAIT_MS)) {
+      delay(50);
+      waited += 50;
+    }
+    if (Serial) {
+      delay(100);  // buffer do host pronto
+    }
   }
-  if (Serial) delay(100);  // buffer do host pronto
-  Serial.printf("Acordando...\n");
+
+  Serial.printf("Acordando... (cause=%d)\n", static_cast<int>(wakeCause));
 
   // Faixa ~0–3,3 V no ADC; ajuste se o divisor do sensor de chuva for diferente.
   analogSetPinAttenuation(RAIN_SENSOR_PIN, ADC_11db);
