@@ -24,7 +24,6 @@
 #define COLD_BOOT_USB_WAIT_MS 2000
 #endif
 
-#define ADC_MAX 4095  // ESP32 ADC 12-bit
 #define RTC_MAGIC 0x4D455448  // "METH" meteo
 
 // Reducao barometrica isotermica: P_nm = P_local * exp(g*h/(R*T_K)), T_K = temperatura medida.
@@ -35,10 +34,7 @@ RTC_DATA_ATTR uint32_t rtc_magic;
 RTC_DATA_ATTR float rtc_sum_temp;
 RTC_DATA_ATTR float rtc_sum_hum;
 RTC_DATA_ATTR float rtc_sum_press;
-RTC_DATA_ATTR float rtc_sum_precip;
 RTC_DATA_ATTR uint8_t rtc_sample_count;
-RTC_DATA_ATTR int16_t rtc_rain_first_raw;
-RTC_DATA_ATTR bool rtc_rain_all_equal;
 
 Adafruit_BME280 bme;
 
@@ -49,10 +45,7 @@ void resetRtcWindow() {
   rtc_sum_temp = 0.0F;
   rtc_sum_hum = 0.0F;
   rtc_sum_press = 0.0F;
-  rtc_sum_precip = 0.0F;
   rtc_sample_count = 0;
-  rtc_rain_first_raw = -1;
-  rtc_rain_all_equal = true;
 }
 
 void enterDeepSleep() {
@@ -158,24 +151,14 @@ void runCycle() {
   float pressureSeaLevel =
       pressureLocal * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
 
-  int rainRaw = analogRead(RAIN_SENSOR_PIN);
-  float precipSample = (float)(ADC_MAX - rainRaw);  // Invertido: maior = mais chuva
-
-  if (rtc_rain_first_raw < 0) {
-    rtc_rain_first_raw = (int16_t)rainRaw;
-  } else if (rainRaw != rtc_rain_first_raw) {
-    rtc_rain_all_equal = false;
-  }
-
   rtc_sum_temp += temperature;
   rtc_sum_hum += humidity;
   rtc_sum_press += pressureSeaLevel;
-  rtc_sum_precip += precipSample;
   rtc_sample_count++;
 
-  Serial.printf("[%d/%d] T:%.2f U:%.2f P:%.2f Chuva:%d\n",
+  Serial.printf("[%d/%d] T:%.2f U:%.2f P:%.2f\n",
                 rtc_sample_count, (int)SAMPLES_PER_API_UPLOAD,
-                temperature, humidity, pressureSeaLevel, rainRaw);
+                temperature, humidity, pressureSeaLevel);
 
   if (rtc_sample_count < SAMPLES_PER_API_UPLOAD) {
     float avgT = rtc_sum_temp / rtc_sample_count;
@@ -188,16 +171,13 @@ void runCycle() {
   float avgTemp = rtc_sum_temp / SAMPLES_PER_API_UPLOAD;
   float avgHum = rtc_sum_hum / SAMPLES_PER_API_UPLOAD;
   float avgPress = rtc_sum_press / SAMPLES_PER_API_UPLOAD;
-  float precipitacao = rtc_rain_all_equal ? 0.0F : (rtc_sum_precip / SAMPLES_PER_API_UPLOAD);
 
-  Serial.printf("Medias finais: T:%.2f U:%.2f P:%.2f Precip:%.2f (chuva_igual=%d)\n",
-                avgTemp, avgHum, avgPress, precipitacao, rtc_rain_all_equal);
+  Serial.printf("Medias finais: T:%.2f U:%.2f P:%.2f\n", avgTemp, avgHum, avgPress);
 
   JsonDocument doc;
   doc["temperatura"] = round(avgTemp * 100) / 100.0;
   doc["umidade"] = round(avgHum * 100) / 100.0;
   doc["pressao"] = round(avgPress * 100) / 100.0;
-  doc["precipitacao"] = round(precipitacao * 100) / 100.0;
 
   char payload[192];
   size_t n = serializeJson(doc, payload, sizeof(payload));
@@ -254,9 +234,6 @@ void setup() {
   }
 
   Serial.printf("Acordando... (cause=%d)\n", static_cast<int>(wakeCause));
-
-  // Faixa ~0–3,3 V no ADC; ajuste se o divisor do sensor de chuva for diferente.
-  analogSetPinAttenuation(RAIN_SENSOR_PIN, ADC_11db);
 
   s_littlefsOk = pendingQueueInit();
 

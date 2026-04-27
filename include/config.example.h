@@ -20,10 +20,7 @@
 // --- Sensores ---
 #define SDA_PIN            8
 #define SCL_PIN            9
-#define RAIN_SENSOR_PIN    7
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica
-// O firmware usa analogSetPinAttenuation(RAIN_SENSOR_PIN, ADC_11db) (~0–3,3 V).
-// Ajuste o divisor/analogico do pluviometro se a faixa for outra.
 
 // --- Temporização ---
 // Intervalo entre acordares (deep sleep). Ex.: 60 = 1 min por ciclo de sono.

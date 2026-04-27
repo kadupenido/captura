@@ -1,12 +1,11 @@
-# Firmware Estação Meteorológica (Captura)
+# Firmware Monitor Ambiental (Captura)
 
-Firmware embarcado para ESP32-S3 que coleta dados meteorológicos (temperatura, umidade, pressão, precipitação) e envia para a API da estação meteorológica.
+Firmware embarcado para ESP32-S3 que coleta dados ambientais (temperatura, umidade, pressão) e envia para a API do Monitor Ambiental.
 
 ## Hardware necessário
 
 - **ESP32-S3 DevKitC-1**
 - **Sensor BME280** (temperatura, umidade, pressão) — comunicação I2C
-- **Sensor de chuva analógico** (resistivo)
 
 ## Esquema de fiação (pinos padrão)
 
@@ -14,9 +13,8 @@ Firmware embarcado para ESP32-S3 que coleta dados meteorológicos (temperatura, 
 |------------|---------------|
 | BME280 SDA | GPIO 8 |
 | BME280 SCL | GPIO 9 |
-| Sensor de chuva | GPIO 7 (analógico ADC) |
 
-Os pinos são configuráveis em `include/config.h` (`SDA_PIN`, `SCL_PIN`, `RAIN_SENSOR_PIN`).
+Os pinos são configuráveis em `include/config.h` (`SDA_PIN`, `SCL_PIN`).
 
 ## Requisitos
 
@@ -63,21 +61,19 @@ O firmware envia dados via `POST {API_BASE_URL}/dados` com o header `Authorizati
 {
   "temperatura": 25.5,
   "umidade": 65.2,
-  "pressao": 1013.25,
-  "precipitacao": 0.0
+  "pressao": 1013.25
 }
 ```
 
-O endpoint e schema esperados estão documentados no projeto da API (FastAPI).
+O endpoint e schema esperados estão documentados no projeto da API (Node).
 
 ## Comportamento
 
 1. **Acorda** do deep sleep a cada 1 minuto (`DEEP_SLEEP_SECONDS` = 60)
-2. **Lê** temperatura, umidade, pressão (BME280) e precipitação (sensor analógico)
+2. **Lê** temperatura, umidade e pressão (BME280)
 3. **Acumula** as leituras na memória RTC (somando e contando amostras)
 4. A cada **10 acordes** (10 min):
    - Calcula médias de temperatura, umidade e pressão
-   - Para precipitação: se todas as 10 leituras do sensor de chuva forem iguais, envia 0 (evita baseline estável em tempo seco); senão envia a média
    - **Conecta** ao Wi-Fi
    - **Envia** as médias em JSON para a API (até 3 tentativas em caso de falha)
    - Reinicia a janela de acumulação na RTC
