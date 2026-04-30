@@ -17,9 +17,23 @@
 #define API_BASE_URL   "http://192.168.1.100:8000"
 #define API_TOKEN      "seu_token_secreto_aqui"
 
-// --- Sensores ---
-#define SDA_PIN            8
-#define SCL_PIN            9
+// --- Sensores I2C (BME280 + SHT31) ---
+#define I2C_SDA_PIN        17
+#define I2C_SCL_PIN        18
+#define BME280_I2C_ADDR    0x76
+#define SHT31_I2C_ADDR     0x44
+
+// --- Medições de tensão (ADC2 - ler ANTES de ligar o WiFi) ---
+// Bateria: divisor 100k + 100k → fator 2.0 (V_real = V_pin * 2)
+#define BAT_ADC_PIN        13
+#define BAT_DIVIDER_RATIO  2.0f
+// Painel solar 6V: divisor 330k + 330k → fator 2.0
+#define SOLAR_ADC_PIN      12
+#define SOLAR_DIVIDER_RATIO 2.0f
+// Amostras de ADC por wake (média) para reduzir ruído
+#define ADC_SAMPLES        16
+
+// --- Pressão atmosférica ---
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica
 
 // --- Temporização ---

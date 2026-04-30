@@ -8,6 +8,7 @@
 #include <esp_sleep.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_SHT31.h>
 
 #include "config.h"
 #include "pending_queue.h"
@@ -24,28 +25,53 @@
 #define COLD_BOOT_USB_WAIT_MS 2000
 #endif
 
-#define RTC_MAGIC 0x4D455448  // "METH" meteo
+#ifndef ADC_SAMPLES
+#define ADC_SAMPLES 16
+#endif
+
+#define RTC_MAGIC 0x4D455449  // "METI" meteo dual
 
 // Reducao barometrica isotermica: P_nm = P_local * exp(g*h/(R*T_K)), T_K = temperatura medida.
 static constexpr float kGravity = 9.80665f;
 static constexpr float kGasConstantDryAir = 287.05f;
 
 RTC_DATA_ATTR uint32_t rtc_magic;
-RTC_DATA_ATTR float rtc_sum_temp;
-RTC_DATA_ATTR float rtc_sum_hum;
+// BME280: temperatura, umidade, pressao
+RTC_DATA_ATTR float rtc_sum_temp_bme;
+RTC_DATA_ATTR float rtc_sum_hum_bme;
 RTC_DATA_ATTR float rtc_sum_press;
-RTC_DATA_ATTR uint8_t rtc_sample_count;
+RTC_DATA_ATTR uint8_t rtc_count_bme;
+// SHT31: temperatura, umidade
+RTC_DATA_ATTR float rtc_sum_temp_sht;
+RTC_DATA_ATTR float rtc_sum_hum_sht;
+RTC_DATA_ATTR uint8_t rtc_count_sht;
+// Tensoes (bateria, painel)
+RTC_DATA_ATTR float rtc_sum_vbat;
+RTC_DATA_ATTR float rtc_sum_vpainel;
+RTC_DATA_ATTR uint8_t rtc_count_v;
+// Total de wakes acumulados na janela
+RTC_DATA_ATTR uint8_t rtc_total_samples;
 
 Adafruit_BME280 bme;
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
 static bool s_littlefsOk = false;
+static bool s_bmeOk = false;
+static bool s_shtOk = false;
 
 void resetRtcWindow() {
   rtc_magic = RTC_MAGIC;
-  rtc_sum_temp = 0.0F;
-  rtc_sum_hum = 0.0F;
+  rtc_sum_temp_bme = 0.0F;
+  rtc_sum_hum_bme = 0.0F;
   rtc_sum_press = 0.0F;
-  rtc_sample_count = 0;
+  rtc_count_bme = 0;
+  rtc_sum_temp_sht = 0.0F;
+  rtc_sum_hum_sht = 0.0F;
+  rtc_count_sht = 0;
+  rtc_sum_vbat = 0.0F;
+  rtc_sum_vpainel = 0.0F;
+  rtc_count_v = 0;
+  rtc_total_samples = 0;
 }
 
 void enterDeepSleep() {
@@ -96,6 +122,25 @@ void wifiOffIfConnected() {
   }
 }
 
+// Le tensao em V usando analogReadMilliVolts (calibrado) e fator do divisor.
+// Faz ADC_SAMPLES leituras e devolve a media. Importante: WiFi precisa estar
+// desligado quando lemos pinos ADC2 (GPIO 11-20 no ESP32-S3).
+float readVoltage(int pin, float dividerRatio) {
+  uint32_t accumMv = 0;
+  int valid = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    uint32_t mv = analogReadMilliVolts(pin);
+    accumMv += mv;
+    valid++;
+    delayMicroseconds(200);
+  }
+  if (valid == 0) {
+    return NAN;
+  }
+  float avgMv = static_cast<float>(accumMv) / static_cast<float>(valid);
+  return (avgMv * dividerRatio) / 1000.0f;
+}
+
 int sendData(const char* payload, size_t payloadLen) {
   char url[192];
   snprintf(url, sizeof(url), "%s/dados", API_BASE_URL);
@@ -135,51 +180,103 @@ int sendPayloadWithRetriesForQueue(const String& payload) {
   return sendPayloadWithRetries(payload.c_str(), payload.length());
 }
 
+static float roundTo2(float v) {
+  return roundf(v * 100.0f) / 100.0f;
+}
+
 void runCycle() {
-  bme.takeForcedMeasurement();
-  float temperature = bme.readTemperature();
-  float humidity = bme.readHumidity();
-  float pressureLocal = bme.readPressure() / 100.0F;
+  // 1) Le tensoes ANTES do WiFi (ADC2 conflita com WiFi no ESP32-S3).
+  float vbat = readVoltage(BAT_ADC_PIN, BAT_DIVIDER_RATIO);
+  float vpainel = readVoltage(SOLAR_ADC_PIN, SOLAR_DIVIDER_RATIO);
+  bool vOk = !isnan(vbat) && !isnan(vpainel);
+  if (vOk) {
+    rtc_sum_vbat += vbat;
+    rtc_sum_vpainel += vpainel;
+    rtc_count_v++;
+  }
 
-  if (isnan(temperature) || isnan(humidity) || isnan(pressureLocal)) {
-    Serial.printf("Leitura invalida do BME280 (NaN).\n");
+  // 2) BME280: temperatura, umidade, pressao
+  bool bmeReadOk = false;
+  float tBme = NAN, hBme = NAN, pLocalBme = NAN, pSeaBme = NAN;
+  if (s_bmeOk) {
+    bme.takeForcedMeasurement();
+    tBme = bme.readTemperature();
+    hBme = bme.readHumidity();
+    pLocalBme = bme.readPressure() / 100.0F;
+    if (!isnan(tBme) && !isnan(hBme) && !isnan(pLocalBme)) {
+      float tKelvin = tBme + 273.15f;
+      pSeaBme = pLocalBme * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
+      rtc_sum_temp_bme += tBme;
+      rtc_sum_hum_bme += hBme;
+      rtc_sum_press += pSeaBme;
+      rtc_count_bme++;
+      bmeReadOk = true;
+    } else {
+      Serial.printf("Leitura invalida do BME280 (NaN).\n");
+    }
+  }
+
+  // 3) SHT31: temperatura, umidade
+  bool shtReadOk = false;
+  float tSht = NAN, hSht = NAN;
+  if (s_shtOk) {
+    tSht = sht31.readTemperature();
+    hSht = sht31.readHumidity();
+    if (!isnan(tSht) && !isnan(hSht)) {
+      rtc_sum_temp_sht += tSht;
+      rtc_sum_hum_sht += hSht;
+      rtc_count_sht++;
+      shtReadOk = true;
+    } else {
+      Serial.printf("Leitura invalida do SHT31 (NaN).\n");
+    }
+  }
+
+  rtc_total_samples++;
+
+  Serial.printf("[%d/%d] BME T:%.2f U:%.2f P:%.2f | SHT T:%.2f U:%.2f | Vbat:%.2f Vpain:%.2f\n",
+                rtc_total_samples, (int)SAMPLES_PER_API_UPLOAD,
+                bmeReadOk ? tBme : NAN,
+                bmeReadOk ? hBme : NAN,
+                bmeReadOk ? pSeaBme : NAN,
+                shtReadOk ? tSht : NAN,
+                shtReadOk ? hSht : NAN,
+                vOk ? vbat : NAN,
+                vOk ? vpainel : NAN);
+
+  if (rtc_total_samples < SAMPLES_PER_API_UPLOAD) {
     wifiOffIfConnected();
     return;
   }
 
-  float tKelvin = temperature + 273.15f;
-  float pressureSeaLevel =
-      pressureLocal * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
-
-  rtc_sum_temp += temperature;
-  rtc_sum_hum += humidity;
-  rtc_sum_press += pressureSeaLevel;
-  rtc_sample_count++;
-
-  Serial.printf("[%d/%d] T:%.2f U:%.2f P:%.2f\n",
-                rtc_sample_count, (int)SAMPLES_PER_API_UPLOAD,
-                temperature, humidity, pressureSeaLevel);
-
-  if (rtc_sample_count < SAMPLES_PER_API_UPLOAD) {
-    float avgT = rtc_sum_temp / rtc_sample_count;
-    Serial.printf("Media parcial T:%.2f U:%.2f P:%.2f\n", avgT,
-                  rtc_sum_hum / rtc_sample_count, rtc_sum_press / rtc_sample_count);
-    wifiOffIfConnected();
-    return;
-  }
-
-  float avgTemp = rtc_sum_temp / SAMPLES_PER_API_UPLOAD;
-  float avgHum = rtc_sum_hum / SAMPLES_PER_API_UPLOAD;
-  float avgPress = rtc_sum_press / SAMPLES_PER_API_UPLOAD;
-
-  Serial.printf("Medias finais: T:%.2f U:%.2f P:%.2f\n", avgTemp, avgHum, avgPress);
-
+  // 4) Janela completa: monta JSON apenas com campos cujo contador > 0.
   JsonDocument doc;
-  doc["temperatura"] = round(avgTemp * 100) / 100.0;
-  doc["umidade"] = round(avgHum * 100) / 100.0;
-  doc["pressao"] = round(avgPress * 100) / 100.0;
 
-  char payload[192];
+  if (rtc_count_bme > 0) {
+    doc["temperatura_bme"] = roundTo2(rtc_sum_temp_bme / rtc_count_bme);
+    doc["umidade_bme"] = roundTo2(rtc_sum_hum_bme / rtc_count_bme);
+    doc["pressao"] = roundTo2(rtc_sum_press / rtc_count_bme);
+  }
+  if (rtc_count_sht > 0) {
+    doc["temperatura_sht"] = roundTo2(rtc_sum_temp_sht / rtc_count_sht);
+    doc["umidade_sht"] = roundTo2(rtc_sum_hum_sht / rtc_count_sht);
+  }
+  if (rtc_count_v > 0) {
+    doc["tensao_bateria"] = roundTo2(rtc_sum_vbat / rtc_count_v);
+    doc["tensao_painel"] = roundTo2(rtc_sum_vpainel / rtc_count_v);
+  }
+
+  if (doc.size() == 0) {
+    Serial.printf("Janela sem nenhuma medicao valida; descartando.\n");
+    wifiOffIfConnected();
+    resetRtcWindow();
+    return;
+  }
+
+  Serial.printf("Janela completa (BME=%d SHT=%d V=%d amostras validas em %d wakes).\n",
+                rtc_count_bme, rtc_count_sht, rtc_count_v, rtc_total_samples);
+
+  char payload[256];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   if (n == 0 || n >= sizeof(payload)) {
     Serial.printf("Erro: JSON excede buffer ou serializacao falhou.\n");
@@ -237,20 +334,30 @@ void setup() {
 
   s_littlefsOk = pendingQueueInit();
 
-  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
-  if (!bme.begin(0x76, &Wire)) {
-    Serial.printf("BME280 nao encontrado! Verifique a fiação.\n");
+  s_bmeOk = bme.begin(BME280_I2C_ADDR, &Wire);
+  if (!s_bmeOk) {
+    Serial.printf("BME280 nao encontrado no endereco 0x%02X.\n", (unsigned)BME280_I2C_ADDR);
+  } else {
+    bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::FILTER_OFF,
+                    Adafruit_BME280::STANDBY_MS_0_5);
+  }
+
+  s_shtOk = sht31.begin(SHT31_I2C_ADDR);
+  if (!s_shtOk) {
+    Serial.printf("SHT31 nao encontrado no endereco 0x%02X.\n", (unsigned)SHT31_I2C_ADDR);
+  }
+
+  if (!s_bmeOk && !s_shtOk) {
+    Serial.printf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
     enterDeepSleep();
     return;
   }
-
-  bme.setSampling(Adafruit_BME280::MODE_FORCED,
-                  Adafruit_BME280::SAMPLING_X1,
-                  Adafruit_BME280::SAMPLING_X1,
-                  Adafruit_BME280::SAMPLING_X1,
-                  Adafruit_BME280::FILTER_OFF,
-                  Adafruit_BME280::STANDBY_MS_0_5);
 
   if (rtc_magic != RTC_MAGIC) {
     resetRtcWindow();
@@ -269,6 +376,11 @@ void setup() {
       wifiOffIfConnected();
     }
   }
+
+  // ATENCAO: drain da fila acima pode ter ligado o WiFi. Como GPIO 12/13 estao
+  // no ADC2, precisamos garantir que o WiFi esteja desligado antes do runCycle
+  // ler as tensoes.
+  wifiOffIfConnected();
 
   runCycle();
 
