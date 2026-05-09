@@ -366,15 +366,33 @@ void setup() {
   if (!s_littlefsOk) {
     Serial.printf("Aviso: fila offline indisponivel (LittleFS).\n");
   } else if (pendingQueueHasPending()) {
+    int pending = pendingQueueCount();
+    if (pending >= 0) {
+      Serial.printf("Fila offline: %d item(ns) pendente(s); tentando enviar...\n", pending);
+    } else {
+      Serial.printf("Fila offline: itens pendentes; tentando enviar...\n");
+    }
     if (ensureWiFi()) {
       int n = pendingQueueFlush(PENDING_FLUSH_MAX_PER_WAKE, sendPayloadWithRetriesForQueue);
+      int remaining = pendingQueueCount();
+      if (remaining < 0) {
+        remaining = pendingQueueHasPending() ? -1 : 0;
+      }
       if (n > 0) {
-        Serial.printf("Fila: enviados %d registro(s) pendente(s).\n", n);
+        if (remaining >= 0) {
+          Serial.printf("Fila: enviados %d; restam %d.\n", n, remaining);
+        } else {
+          Serial.printf("Fila: enviados %d registro(s) pendente(s).\n", n);
+        }
+      } else if (remaining > 0) {
+        Serial.printf("Fila: nada enviado; restam %d.\n", remaining);
       }
     } else {
       Serial.printf("Fila: WiFi indisponivel; pendencias permanecem na flash.\n");
       wifiOffIfConnected();
     }
+  } else {
+    Serial.printf("Fila offline: vazia.\n");
   }
 
   // ATENCAO: drain da fila acima pode ter ligado o WiFi. Como GPIO 12/13 estao

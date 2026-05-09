@@ -51,9 +51,11 @@
 // Maximo de POSTs por acordar ao drenar a fila (evita WiFi ligado demais).
 #define PENDING_FLUSH_MAX_PER_WAKE  10
 // Teto de tamanho do arquivo NDJSON; ao estourar, remove linhas mais antigas.
-#define PENDING_MAX_BYTES           65536
+// Dimensionado para ~5 dias de backlog com DEEP_SLEEP_SECONDS=120 e
+// SAMPLES_PER_API_UPLOAD=5 (1 linha a cada 10 min => 720 linhas em 5 dias).
+#define PENDING_MAX_BYTES           262144
 // Limite extra por numero de linhas (cada janela = 1 linha).
-#define PENDING_MAX_LINES           500
+#define PENDING_MAX_LINES           800
 
 // Descomente para habilitar prints no Serial (debug)
 // #define DEBUG_MODE

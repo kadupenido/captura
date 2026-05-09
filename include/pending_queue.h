@@ -8,6 +8,8 @@ using PendingSendFn = int (*)(const String& payload);
 
 bool pendingQueueInit();
 bool pendingQueueHasPending();
+// Numero atual de linhas pendentes; -1 se a contagem ainda nao esta valida.
+int pendingQueueCount();
 bool pendingQueueAppend(const String& jsonLine);
 bool pendingQueueAppend(const char* jsonLine);
 // Envia ate maxItems linhas (FIFO). WiFi deve estar conectado pelo chamador.

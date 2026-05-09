@@ -7,10 +7,10 @@
 #include "config.h"
 
 #ifndef PENDING_MAX_BYTES
-#define PENDING_MAX_BYTES 65536
+#define PENDING_MAX_BYTES 262144
 #endif
 #ifndef PENDING_MAX_LINES
-#define PENDING_MAX_LINES 500
+#define PENDING_MAX_LINES 800
 #endif
 
 static const char* const kPendingPath = "/pending.ndjson";
@@ -144,6 +144,9 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
 
   if (s_lineCountValid) {
     s_pendingLineCount++;
+    Serial.printf("Fila offline: gravado (total %d).\n", s_pendingLineCount);
+  } else {
+    Serial.printf("Fila offline: gravado.\n");
   }
   return true;
 }
@@ -175,10 +178,17 @@ bool pendingQueueInit() {
 
   s_pendingLineCount = countLinesFromFile();
   s_lineCountValid = true;
+  if (s_pendingLineCount > 0) {
+    Serial.printf("Fila offline: %d item(ns) pendente(s) na flash.\n", s_pendingLineCount);
+  } else {
+    Serial.printf("Fila offline: vazia.\n");
+  }
   return true;
 }
 
 bool pendingQueueHasPending() { return pendingFileSize() > 0; }
+
+int pendingQueueCount() { return s_lineCountValid ? s_pendingLineCount : -1; }
 
 bool pendingQueueAppend(const String& jsonLine) {
   if (jsonLine.isEmpty()) {
