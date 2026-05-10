@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <esp_sleep.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
@@ -27,6 +28,19 @@
 
 #ifndef ADC_SAMPLES
 #define ADC_SAMPLES 16
+#endif
+
+#ifndef NTP_SERVER_PRIMARY
+#define NTP_SERVER_PRIMARY "pool.ntp.org"
+#endif
+#ifndef NTP_SERVER_SECONDARY
+#define NTP_SERVER_SECONDARY "time.google.com"
+#endif
+#ifndef NTP_SYNC_WAIT_MS
+#define NTP_SYNC_WAIT_MS 3500
+#endif
+#ifndef NTP_MIN_VALID_YEAR
+#define NTP_MIN_VALID_YEAR 2024
 #endif
 
 #define RTC_MAGIC 0x4D455449  // "METI" meteo dual
@@ -108,11 +122,59 @@ bool connectWiFi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+static bool wallClockLooksSynced() {
+  struct tm t {};
+  if (!getLocalTime(&t, 50)) {
+    return false;
+  }
+  return (t.tm_year + 1900) >= NTP_MIN_VALID_YEAR;
+}
+
+static void trySyncTimeFromNtp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (wallClockLooksSynced()) {
+    return;
+  }
+  configTime(0, 0, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+  const uint32_t start = millis();
+  while (millis() - start < static_cast<uint32_t>(NTP_SYNC_WAIT_MS) && WiFi.status() == WL_CONNECTED) {
+    if (wallClockLooksSynced()) {
+      Serial.printf("NTP: sincronizado.\n");
+      return;
+    }
+    delay(100);
+  }
+  Serial.printf("NTP: timeout (RTC pode estar invalido neste wake).\n");
+}
+
+static void appendCreatedAtUtcIfSynced(JsonDocument& doc) {
+  if (!wallClockLooksSynced()) {
+    return;
+  }
+  const time_t now = time(nullptr);
+  struct tm t {};
+  if (!gmtime_r(&now, &t)) {
+    return;
+  }
+  char buf[32];
+  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t) == 0) {
+    return;
+  }
+  doc["created_at"] = buf;
+}
+
 bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
+    trySyncTimeFromNtp();
     return true;
   }
-  return connectWiFi();
+  if (!connectWiFi()) {
+    return false;
+  }
+  trySyncTimeFromNtp();
+  return true;
 }
 
 void wifiOffIfConnected() {
@@ -276,7 +338,10 @@ void runCycle() {
   Serial.printf("Janela completa (BME=%d SHT=%d V=%d amostras validas em %d wakes).\n",
                 rtc_count_bme, rtc_count_sht, rtc_count_v, rtc_total_samples);
 
-  char payload[256];
+  const bool wifiUp = ensureWiFi();
+  appendCreatedAtUtcIfSynced(doc);
+
+  char payload[512];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   if (n == 0 || n >= sizeof(payload)) {
     Serial.printf("Erro: JSON excede buffer ou serializacao falhou.\n");
@@ -285,7 +350,7 @@ void runCycle() {
     return;
   }
 
-  if (!ensureWiFi()) {
+  if (!wifiUp) {
     Serial.printf("Falha ao conectar WiFi; gravando na fila local.\n");
     if (s_littlefsOk && !pendingQueueAppend(payload)) {
       Serial.printf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
