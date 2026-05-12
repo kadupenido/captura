@@ -33,6 +33,20 @@
 // Amostras de ADC por wake (média) para reduzir ruído
 #define ADC_SAMPLES        16
 
+// --- Irrigação (solo + bombas) ---
+#define SOIL_ADC_PIN_1      15
+#define SOIL_ADC_PIN_2      16
+#define RELAY_PIN_1         10
+#define RELAY_PIN_2         11
+// 1 = relé ativo em nível alto; 0 = ativo em nível baixo.
+#define RELAY_ACTIVE_HIGH   1
+// Calibração da umidade do solo (mV). Ajuste conforme os sensores reais.
+// Fórmula usa interpolação linear: 0% em DRY_MV e 100% em WET_MV.
+#define SOIL1_DRY_MV        2600.0f
+#define SOIL1_WET_MV        1200.0f
+#define SOIL2_DRY_MV        2600.0f
+#define SOIL2_WET_MV        1200.0f
+
 // --- Pressão atmosférica ---
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica
 
