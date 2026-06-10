@@ -18,26 +18,22 @@
 #define API_TOKEN      "seu_token_secreto_aqui"
 
 // --- Sensores I2C (BME280 + SHT31) ---
-#define I2C_SDA_PIN        17
-#define I2C_SCL_PIN        18
+#define I2C_SDA_PIN        8
+#define I2C_SCL_PIN        9
 #define BME280_I2C_ADDR    0x76
 #define SHT31_I2C_ADDR     0x44
 
-// --- Medições de tensão (ADC2 - ler ANTES de ligar o WiFi) ---
-// Bateria: divisor 100k + 100k → fator 2.0 (V_real = V_pin * 2)
-#define BAT_ADC_PIN        13
-#define BAT_DIVIDER_RATIO  2.0f
-// Painel solar 6V: divisor 330k + 330k → fator 2.0
-#define SOLAR_ADC_PIN      12
-#define SOLAR_DIVIDER_RATIO 2.0f
-// Amostras de ADC por wake (média) para reduzir ruído
-#define ADC_SAMPLES        16
+// --- INA219 (tensao/corrente/potencia) ---
+#define INA_SDA_PIN           15
+#define INA_SCL_PIN           16
+#define INA219_PAINEL_ADDR    0x40
+#define INA219_SISTEMA_ADDR   0x41
 
 // --- Irrigação (solo + bombas) ---
-#define SOIL_ADC_PIN_1      15
-#define SOIL_ADC_PIN_2      16
-#define RELAY_PIN_1         10
-#define RELAY_PIN_2         11
+#define SOIL_ADC_PIN_1      37
+#define SOIL_ADC_PIN_2      38
+#define RELAY_PIN_1         35
+#define RELAY_PIN_2         36
 // 1 = relé ativo em nível alto; 0 = ativo em nível baixo.
 #define RELAY_ACTIVE_HIGH   1
 // Calibração da umidade do solo (mV). Ajuste conforme os sensores reais.
@@ -46,6 +42,8 @@
 #define SOIL1_WET_MV        1200.0f
 #define SOIL2_DRY_MV        2600.0f
 #define SOIL2_WET_MV        1200.0f
+// Teto de seguranca por comando de irrigacao manual (s).
+#define MANUAL_IRRIGATION_MAX_S   600
 
 // --- Pressão atmosférica ---
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica

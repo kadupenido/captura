@@ -10,6 +10,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SHT31.h>
+#include <Adafruit_INA219.h>
 
 #include "config.h"
 #include "pending_queue.h"
@@ -28,6 +29,10 @@
 
 #ifndef ADC_SAMPLES
 #define ADC_SAMPLES 16
+#endif
+
+#ifndef MANUAL_IRRIGATION_MAX_S
+#define MANUAL_IRRIGATION_MAX_S 600
 #endif
 
 #ifndef NTP_SERVER_PRIMARY
@@ -50,19 +55,23 @@ static constexpr float kGravity = 9.80665f;
 static constexpr float kGasConstantDryAir = 287.05f;
 
 RTC_DATA_ATTR uint32_t rtc_magic;
-// BME280: temperatura, umidade, pressao
-RTC_DATA_ATTR float rtc_sum_temp_bme;
-RTC_DATA_ATTR float rtc_sum_hum_bme;
+// BME280: somente pressao
 RTC_DATA_ATTR float rtc_sum_press;
-RTC_DATA_ATTR uint8_t rtc_count_bme;
-// SHT31: temperatura, umidade
-RTC_DATA_ATTR float rtc_sum_temp_sht;
-RTC_DATA_ATTR float rtc_sum_hum_sht;
-RTC_DATA_ATTR uint8_t rtc_count_sht;
-// Tensoes (bateria, painel)
-RTC_DATA_ATTR float rtc_sum_vbat;
+RTC_DATA_ATTR uint8_t rtc_count_press;
+// SHT31: temperatura, umidade (fonte exclusiva)
+RTC_DATA_ATTR float rtc_sum_temp;
+RTC_DATA_ATTR float rtc_sum_hum;
+RTC_DATA_ATTR uint8_t rtc_count_temp_hum;
+// INA219 painel
 RTC_DATA_ATTR float rtc_sum_vpainel;
-RTC_DATA_ATTR uint8_t rtc_count_v;
+RTC_DATA_ATTR float rtc_sum_ipainel;
+RTC_DATA_ATTR float rtc_sum_ppainel;
+RTC_DATA_ATTR uint8_t rtc_count_painel;
+// INA219 sistema
+RTC_DATA_ATTR float rtc_sum_vsistema;
+RTC_DATA_ATTR float rtc_sum_isistema;
+RTC_DATA_ATTR float rtc_sum_psistema;
+RTC_DATA_ATTR uint8_t rtc_count_sistema;
 // Umidade do solo por zona
 RTC_DATA_ATTR float rtc_sum_soil_1;
 RTC_DATA_ATTR float rtc_sum_soil_2;
@@ -73,13 +82,23 @@ RTC_DATA_ATTR uint8_t rtc_total_samples;
 // Histerese da irrigacao por zona (persistente entre wakes).
 RTC_DATA_ATTR uint8_t rtc_irrigation_armed_1;
 RTC_DATA_ATTR uint8_t rtc_irrigation_armed_2;
+// Irrigacao manual: segundos acumulados na janela (entram em tempo_irrigacao_s_N).
+RTC_DATA_ATTR uint16_t rtc_manual_irrig_s_1;
+RTC_DATA_ATTR uint16_t rtc_manual_irrig_s_2;
+// Ultimo comando manual executado por zona (evita re-execucao se o ack falhar).
+RTC_DATA_ATTR int32_t rtc_last_manual_id_1;
+RTC_DATA_ATTR int32_t rtc_last_manual_id_2;
 
 Adafruit_BME280 bme;
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
+Adafruit_INA219 inaPainel(INA219_PAINEL_ADDR);
+Adafruit_INA219 inaSistema(INA219_SISTEMA_ADDR);
 
 static bool s_littlefsOk = false;
 static bool s_bmeOk = false;
 static bool s_shtOk = false;
+static bool s_inaPainelOk = false;
+static bool s_inaSistemaOk = false;
 
 struct IrrigationZoneConfig {
   float thresholdPct = NAN;
@@ -135,20 +154,25 @@ static float readSoilPercent(int pin, float dryMv, float wetMv) {
 
 void resetRtcWindow() {
   rtc_magic = RTC_MAGIC;
-  rtc_sum_temp_bme = 0.0F;
-  rtc_sum_hum_bme = 0.0F;
   rtc_sum_press = 0.0F;
-  rtc_count_bme = 0;
-  rtc_sum_temp_sht = 0.0F;
-  rtc_sum_hum_sht = 0.0F;
-  rtc_count_sht = 0;
-  rtc_sum_vbat = 0.0F;
+  rtc_count_press = 0;
+  rtc_sum_temp = 0.0F;
+  rtc_sum_hum = 0.0F;
+  rtc_count_temp_hum = 0;
   rtc_sum_vpainel = 0.0F;
-  rtc_count_v = 0;
+  rtc_sum_ipainel = 0.0F;
+  rtc_sum_ppainel = 0.0F;
+  rtc_count_painel = 0;
+  rtc_sum_vsistema = 0.0F;
+  rtc_sum_isistema = 0.0F;
+  rtc_sum_psistema = 0.0F;
+  rtc_count_sistema = 0;
   rtc_sum_soil_1 = 0.0F;
   rtc_sum_soil_2 = 0.0F;
   rtc_count_soil_1 = 0;
   rtc_count_soil_2 = 0;
+  rtc_manual_irrig_s_1 = 0;
+  rtc_manual_irrig_s_2 = 0;
   rtc_total_samples = 0;
 }
 
@@ -158,6 +182,7 @@ void enterDeepSleep() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   Wire.end();
+  Wire1.end();
   esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
   Serial.printf("Entrando em deep sleep por %d segundos...\n", DEEP_SLEEP_SECONDS);
   Serial.flush();
@@ -248,17 +273,6 @@ void wifiOffIfConnected() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
   }
-}
-
-// Le tensao em V usando analogReadMilliVolts (calibrado) e fator do divisor.
-// Faz ADC_SAMPLES leituras e devolve a media. Importante: WiFi precisa estar
-// desligado quando lemos pinos ADC2 (GPIO 11-20 no ESP32-S3).
-float readVoltage(int pin, float dividerRatio) {
-  float avgMv = readAdcMilliVoltsAvg(pin);
-  if (isnan(avgMv)) {
-    return NAN;
-  }
-  return (avgMv * dividerRatio) / 1000.0f;
 }
 
 int sendData(const char* payload, size_t payloadLen) {
@@ -355,6 +369,154 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
   return cfg.valid;
 }
 
+static int runPump(int relayPin, int durationS);
+
+struct ManualCommand {
+  int32_t id = 0;
+  int zone = 0;
+  int durationS = 0;
+};
+
+// Busca comandos manuais pendentes. Retorna -1 em falha, ou 0..2 comandos em out (ordem por zona).
+static int fetchPendingManualCommands(ManualCommand out[2]) {
+  char url[192];
+  snprintf(url, sizeof(url), "%s/irrigation/manual/pending", API_BASE_URL);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("Authorization", "Bearer " API_TOKEN);
+  const int code = http.GET();
+  if (code != 200) {
+    Serial.printf("Irrigacao manual: GET /irrigation/manual/pending falhou (%d).\n", code);
+    http.end();
+    return -1;
+  }
+
+  const String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("Irrigacao manual: JSON invalido (%s).\n", err.c_str());
+    return -1;
+  }
+
+  JsonArray commands = doc["commands"].as<JsonArray>();
+  if (commands.isNull()) {
+    Serial.printf("Irrigacao manual: resposta sem campo commands.\n");
+    return -1;
+  }
+
+  int n = 0;
+  for (JsonVariant item : commands) {
+    if (n >= 2) {
+      break;
+    }
+    const int32_t id = item["id"] | 0;
+    const int zone = item["zone"] | 0;
+    const int durationS = item["duration_s"] | 0;
+    if (id <= 0 || (zone != 1 && zone != 2) || durationS < 1) {
+      Serial.printf("Irrigacao manual: comando invalido ignorado.\n");
+      continue;
+    }
+    out[n].id = id;
+    out[n].zone = zone;
+    out[n].durationS = durationS;
+    n++;
+  }
+  return n;
+}
+
+// Confirma execucao na API. 404/409 sao terminais: o comando deixou de estar
+// pendente no servidor e nao sera re-executado.
+static bool ackManualCommand(int32_t id, int executedS) {
+  char url[192];
+  snprintf(url, sizeof(url), "%s/irrigation/manual/%ld/ack", API_BASE_URL, (long)id);
+  char body[48];
+  snprintf(body, sizeof(body), "{\"executed_duration_s\":%d}", executedS);
+
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " API_TOKEN);
+    const int code = http.POST(reinterpret_cast<uint8_t*>(body), strlen(body));
+    http.end();
+    if (code == 200) {
+      Serial.printf("Irrigacao manual: ack do comando %ld confirmado.\n", (long)id);
+      return true;
+    }
+    if (code == 404 || code == 409) {
+      Serial.printf("Irrigacao manual: ack do comando %ld respondeu %d; tratado como concluido.\n",
+                    (long)id, code);
+      return true;
+    }
+    Serial.printf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
+    if (attempt < HTTP_MAX_RETRIES) {
+      delay(2000);
+    }
+  }
+  return false;
+}
+
+// Verifica e executa comandos manuais em todo wake (liga WiFi se preciso).
+// Deve rodar APOS as leituras de ADC/sensores (restricao ADC2 x WiFi).
+static void processManualIrrigation() {
+  if (!ensureWiFi()) {
+    Serial.printf("Irrigacao manual: WiFi indisponivel; verificacao ignorada.\n");
+    return;
+  }
+
+  ManualCommand cmds[2];
+  const int n = fetchPendingManualCommands(cmds);
+  if (n <= 0) {
+    return;
+  }
+
+  for (int i = 0; i < n; i++) {
+    const ManualCommand& cmd = cmds[i];
+    int32_t& lastId = (cmd.zone == 1) ? rtc_last_manual_id_1 : rtc_last_manual_id_2;
+    if (cmd.id == lastId) {
+      // Ja executado em wake anterior; ack se perdeu — apenas reenvia.
+      Serial.printf("Irrigacao manual: comando %ld (zona %d) ja executado; reenviando ack.\n",
+                    (long)cmd.id, cmd.zone);
+      ackManualCommand(cmd.id, cmd.durationS);
+      continue;
+    }
+    const int relayPin = (cmd.zone == 1) ? RELAY_PIN_1 : RELAY_PIN_2;
+    Serial.printf("Irrigacao manual: acionando bomba da zona %d por %d s (comando %ld).\n",
+                  cmd.zone, cmd.durationS, (long)cmd.id);
+    const int ranS = runPump(relayPin, cmd.durationS);
+    if (cmd.zone == 1) {
+      rtc_manual_irrig_s_1 += static_cast<uint16_t>(ranS);
+    } else {
+      rtc_manual_irrig_s_2 += static_cast<uint16_t>(ranS);
+    }
+    lastId = cmd.id;
+    ackManualCommand(cmd.id, ranS);
+  }
+}
+
+// Unico ponto que energiza uma bomba. Regra: nunca as duas ao mesmo tempo —
+// o rele da outra bomba e desligado antes de ligar este (acionamento bloqueante).
+static int runPump(int relayPin, int durationS) {
+  if (durationS <= 0) {
+    return 0;
+  }
+  if (durationS > MANUAL_IRRIGATION_MAX_S) {
+    durationS = MANUAL_IRRIGATION_MAX_S;
+  }
+  const int otherPin = (relayPin == RELAY_PIN_1) ? RELAY_PIN_2 : RELAY_PIN_1;
+  setRelayState(otherPin, false);
+  setRelayState(relayPin, true);
+  delay(static_cast<uint32_t>(durationS) * 1000UL);
+  setRelayState(relayPin, false);
+  return durationS;
+}
+
 static int maybeIrrigateZone(int relayPin, float soilPct, IrrigationZoneConfig cfg, uint8_t& armedFlag) {
   if (!cfg.valid || isnan(soilPct)) {
     return 0;
@@ -373,12 +535,10 @@ static int maybeIrrigateZone(int relayPin, float soilPct, IrrigationZoneConfig c
   if (armed && soilPct < cfg.thresholdPct && cfg.pumpDurationS > 0) {
     Serial.printf("Irrigacao: acionando rele GPIO %d por %d s (solo=%.1f%%, limiar=%.1f%%).\n",
                   relayPin, cfg.pumpDurationS, soilPct, cfg.thresholdPct);
-    setRelayState(relayPin, true);
-    delay(cfg.pumpDurationS * 1000);
-    setRelayState(relayPin, false);
+    const int ranS = runPump(relayPin, cfg.pumpDurationS);
     armed = false;
     armedFlag = armed ? 1 : 0;
-    return cfg.pumpDurationS;
+    return ranS;
   }
 
   armedFlag = armed ? 1 : 0;
@@ -390,15 +550,7 @@ static float roundTo2(float v) {
 }
 
 void runCycle() {
-  // 1) Le tensoes e umidade do solo ANTES do WiFi (ADC2 conflita no ESP32-S3).
-  float vbat = readVoltage(BAT_ADC_PIN, BAT_DIVIDER_RATIO);
-  float vpainel = readVoltage(SOLAR_ADC_PIN, SOLAR_DIVIDER_RATIO);
-  bool vOk = !isnan(vbat) && !isnan(vpainel);
-  if (vOk) {
-    rtc_sum_vbat += vbat;
-    rtc_sum_vpainel += vpainel;
-    rtc_count_v++;
-  }
+  // 1) Le umidade do solo.
   float soil1 = readSoilPercent(SOIL_ADC_PIN_1, SOIL1_DRY_MV, SOIL1_WET_MV);
   float soil2 = readSoilPercent(SOIL_ADC_PIN_2, SOIL2_DRY_MV, SOIL2_WET_MV);
   if (!isnan(soil1)) {
@@ -410,55 +562,91 @@ void runCycle() {
     rtc_count_soil_2++;
   }
 
-  // 2) BME280: temperatura, umidade, pressao
+  // 2) BME280: somente pressao (corrigida para nivel do mar com temperatura do SHT31).
   bool bmeReadOk = false;
-  float tBme = NAN, hBme = NAN, pLocalBme = NAN, pSeaBme = NAN;
+  float pLocalBme = NAN, pSeaBme = NAN;
   if (s_bmeOk) {
     bme.takeForcedMeasurement();
-    tBme = bme.readTemperature();
-    hBme = bme.readHumidity();
     pLocalBme = bme.readPressure() / 100.0F;
-    if (!isnan(tBme) && !isnan(hBme) && !isnan(pLocalBme)) {
-      float tKelvin = tBme + 273.15f;
+    if (!isnan(pLocalBme)) {
+      const float tempRefC = (rtc_count_temp_hum > 0) ? (rtc_sum_temp / rtc_count_temp_hum) : 25.0f;
+      float tKelvin = tempRefC + 273.15f;
       pSeaBme = pLocalBme * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
-      rtc_sum_temp_bme += tBme;
-      rtc_sum_hum_bme += hBme;
       rtc_sum_press += pSeaBme;
-      rtc_count_bme++;
+      rtc_count_press++;
       bmeReadOk = true;
     } else {
       Serial.printf("Leitura invalida do BME280 (NaN).\n");
     }
   }
 
-  // 3) SHT31: temperatura, umidade
+  // 3) SHT31: temperatura e umidade (fonte unica).
   bool shtReadOk = false;
-  float tSht = NAN, hSht = NAN;
+  float temperatura = NAN, umidade = NAN;
   if (s_shtOk) {
-    tSht = sht31.readTemperature();
-    hSht = sht31.readHumidity();
-    if (!isnan(tSht) && !isnan(hSht)) {
-      rtc_sum_temp_sht += tSht;
-      rtc_sum_hum_sht += hSht;
-      rtc_count_sht++;
+    temperatura = sht31.readTemperature();
+    umidade = sht31.readHumidity();
+    if (!isnan(temperatura) && !isnan(umidade)) {
+      rtc_sum_temp += temperatura;
+      rtc_sum_hum += umidade;
+      rtc_count_temp_hum++;
       shtReadOk = true;
     } else {
       Serial.printf("Leitura invalida do SHT31 (NaN).\n");
     }
   }
 
+  // 4) INA219: painel (0x40) e sistema (0x41)
+  bool inaPainelReadOk = false;
+  bool inaSistemaReadOk = false;
+  float vPainel = NAN, iPainel = NAN, pPainel = NAN;
+  float vSistema = NAN, iSistema = NAN, pSistema = NAN;
+  if (s_inaPainelOk) {
+    vPainel = inaPainel.getBusVoltage_V();
+    iPainel = inaPainel.getCurrent_mA();
+    pPainel = inaPainel.getPower_mW();
+    if (!isnan(vPainel) && !isnan(iPainel) && !isnan(pPainel)) {
+      rtc_sum_vpainel += vPainel;
+      rtc_sum_ipainel += iPainel;
+      rtc_sum_ppainel += pPainel;
+      rtc_count_painel++;
+      inaPainelReadOk = true;
+    } else {
+      Serial.printf("Leitura invalida do INA219 painel (NaN).\n");
+    }
+  }
+  if (s_inaSistemaOk) {
+    vSistema = inaSistema.getBusVoltage_V();
+    iSistema = inaSistema.getCurrent_mA();
+    pSistema = inaSistema.getPower_mW();
+    if (!isnan(vSistema) && !isnan(iSistema) && !isnan(pSistema)) {
+      rtc_sum_vsistema += vSistema;
+      rtc_sum_isistema += iSistema;
+      rtc_sum_psistema += pSistema;
+      rtc_count_sistema++;
+      inaSistemaReadOk = true;
+    } else {
+      Serial.printf("Leitura invalida do INA219 sistema (NaN).\n");
+    }
+  }
+
   rtc_total_samples++;
 
-  Serial.printf("[%d/%d] BME T:%.2f U:%.2f P:%.2f | SHT T:%.2f U:%.2f | Vbat:%.2f Vpain:%.2f\n",
+  Serial.printf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
                 rtc_total_samples, (int)SAMPLES_PER_API_UPLOAD,
-                bmeReadOk ? tBme : NAN,
-                bmeReadOk ? hBme : NAN,
                 bmeReadOk ? pSeaBme : NAN,
-                shtReadOk ? tSht : NAN,
-                shtReadOk ? hSht : NAN,
-                vOk ? vbat : NAN,
-                vOk ? vpainel : NAN);
+                shtReadOk ? temperatura : NAN,
+                shtReadOk ? umidade : NAN,
+                inaPainelReadOk ? vPainel : NAN,
+                inaPainelReadOk ? iPainel : NAN,
+                inaPainelReadOk ? pPainel : NAN,
+                inaSistemaReadOk ? vSistema : NAN,
+                inaSistemaReadOk ? iSistema : NAN,
+                inaSistemaReadOk ? pSistema : NAN);
   Serial.printf("Solo Z1:%.1f%% Z2:%.1f%%\n", soil1, soil2);
+
+  // Comandos manuais sao verificados em todo wake (apos leituras de ADC/sensores).
+  processManualIrrigation();
 
   if (rtc_total_samples < SAMPLES_PER_API_UPLOAD) {
     wifiOffIfConnected();
@@ -468,18 +656,22 @@ void runCycle() {
   // 4) Janela completa: monta JSON apenas com campos cujo contador > 0.
   JsonDocument doc;
 
-  if (rtc_count_bme > 0) {
-    doc["temperatura_bme"] = roundTo2(rtc_sum_temp_bme / rtc_count_bme);
-    doc["umidade_bme"] = roundTo2(rtc_sum_hum_bme / rtc_count_bme);
-    doc["pressao"] = roundTo2(rtc_sum_press / rtc_count_bme);
+  if (rtc_count_temp_hum > 0) {
+    doc["temperatura"] = roundTo2(rtc_sum_temp / rtc_count_temp_hum);
+    doc["umidade"] = roundTo2(rtc_sum_hum / rtc_count_temp_hum);
   }
-  if (rtc_count_sht > 0) {
-    doc["temperatura_sht"] = roundTo2(rtc_sum_temp_sht / rtc_count_sht);
-    doc["umidade_sht"] = roundTo2(rtc_sum_hum_sht / rtc_count_sht);
+  if (rtc_count_press > 0) {
+    doc["pressao"] = roundTo2(rtc_sum_press / rtc_count_press);
   }
-  if (rtc_count_v > 0) {
-    doc["tensao_bateria"] = roundTo2(rtc_sum_vbat / rtc_count_v);
-    doc["tensao_painel"] = roundTo2(rtc_sum_vpainel / rtc_count_v);
+  if (rtc_count_painel > 0) {
+    doc["tensao_painel"] = roundTo2(rtc_sum_vpainel / rtc_count_painel);
+    doc["corrente_painel"] = roundTo2(rtc_sum_ipainel / rtc_count_painel);
+    doc["potencia_painel"] = roundTo2(rtc_sum_ppainel / rtc_count_painel);
+  }
+  if (rtc_count_sistema > 0) {
+    doc["tensao_sistema"] = roundTo2(rtc_sum_vsistema / rtc_count_sistema);
+    doc["corrente_sistema"] = roundTo2(rtc_sum_isistema / rtc_count_sistema);
+    doc["potencia_sistema"] = roundTo2(rtc_sum_psistema / rtc_count_sistema);
   }
   if (rtc_count_soil_1 > 0) {
     doc["umidade_solo_1"] = roundTo2(rtc_sum_soil_1 / rtc_count_soil_1);
@@ -495,15 +687,15 @@ void runCycle() {
     return;
   }
 
-  Serial.printf("Janela completa (BME=%d SHT=%d V=%d amostras validas em %d wakes).\n",
-                rtc_count_bme, rtc_count_sht, rtc_count_v, rtc_total_samples);
+  Serial.printf("Janela completa (TH=%d Press=%d Painel=%d Sistema=%d amostras validas em %d wakes).\n",
+                rtc_count_temp_hum, rtc_count_press, rtc_count_painel, rtc_count_sistema, rtc_total_samples);
 
   const bool wifiUp = ensureWiFi();
 
   if (!wifiUp) {
     Serial.printf("Falha ao conectar WiFi; gravando na fila local.\n");
-    doc["tempo_irrigacao_s_1"] = 0;
-    doc["tempo_irrigacao_s_2"] = 0;
+    doc["tempo_irrigacao_s_1"] = rtc_manual_irrig_s_1;
+    doc["tempo_irrigacao_s_2"] = rtc_manual_irrig_s_2;
     appendCreatedAtUtcIfSynced(doc);
     char payloadOffline[768];
     size_t nOffline = serializeJson(doc, payloadOffline, sizeof(payloadOffline));
@@ -542,8 +734,8 @@ void runCycle() {
   setRelayState(RELAY_PIN_1, false);
   setRelayState(RELAY_PIN_2, false);
 
-  doc["tempo_irrigacao_s_1"] = irrigationSeconds1;
-  doc["tempo_irrigacao_s_2"] = irrigationSeconds2;
+  doc["tempo_irrigacao_s_1"] = irrigationSeconds1 + rtc_manual_irrig_s_1;
+  doc["tempo_irrigacao_s_2"] = irrigationSeconds2 + rtc_manual_irrig_s_2;
   appendCreatedAtUtcIfSynced(doc);
 
   char payload[768];
@@ -597,6 +789,7 @@ void setup() {
   setRelayState(RELAY_PIN_2, false);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire1.begin(INA_SDA_PIN, INA_SCL_PIN);
 
   s_bmeOk = bme.begin(BME280_I2C_ADDR, &Wire);
   if (!s_bmeOk) {
@@ -615,7 +808,16 @@ void setup() {
     Serial.printf("SHT31 nao encontrado no endereco 0x%02X.\n", (unsigned)SHT31_I2C_ADDR);
   }
 
-  if (!s_bmeOk && !s_shtOk) {
+  s_inaPainelOk = inaPainel.begin(&Wire1);
+  if (!s_inaPainelOk) {
+    Serial.printf("INA219 painel nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_PAINEL_ADDR);
+  }
+  s_inaSistemaOk = inaSistema.begin(&Wire1);
+  if (!s_inaSistemaOk) {
+    Serial.printf("INA219 sistema nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_SISTEMA_ADDR);
+  }
+
+  if (!s_bmeOk && !s_shtOk && !s_inaPainelOk && !s_inaSistemaOk) {
     Serial.printf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
     enterDeepSleep();
     return;
@@ -625,6 +827,8 @@ void setup() {
     resetRtcWindow();
     rtc_irrigation_armed_1 = 1;
     rtc_irrigation_armed_2 = 1;
+    rtc_last_manual_id_1 = 0;
+    rtc_last_manual_id_2 = 0;
   } else {
     if (rtc_irrigation_armed_1 > 1) rtc_irrigation_armed_1 = 1;
     if (rtc_irrigation_armed_2 > 1) rtc_irrigation_armed_2 = 1;
@@ -662,9 +866,7 @@ void setup() {
     Serial.printf("Fila offline: vazia.\n");
   }
 
-  // ATENCAO: drain da fila acima pode ter ligado o WiFi. Como GPIO 12/13 estao
-  // no ADC2, precisamos garantir que o WiFi esteja desligado antes do runCycle
-  // ler as tensoes.
+  // O envio da fila pode ter ligado o WiFi; desliga antes de seguir o ciclo.
   wifiOffIfConnected();
 
   runCycle();
