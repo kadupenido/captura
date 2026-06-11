@@ -1,110 +1,113 @@
 # Firmware Monitor Ambiental (Captura)
 
-Firmware embarcado para ESP32-S3 que coleta dados ambientais (temperatura, umidade, pressão) por dois sensores I2C (BME280 + SHT31), além de monitorar a tensão da bateria e do painel solar via dois divisores resistivos. Envia tudo para a API do Monitor Ambiental.
+Firmware embarcado para **ESP32-S3 DevKitC-1** que coleta dados ambientais, monitora energia (INA219), mede umidade do solo e controla duas zonas de irrigação. Envia médias agregadas para a API e consulta comandos manuais de irrigação em todo acordar.
 
-## Hardware necessário
+Diagrama de pinos: [`esp32s3_pinout.svg`](esp32s3_pinout.svg).
 
-- **ESP32-S3 DevKitC-1**
-- **Sensor BME280** (temperatura, umidade, pressão) — I2C, endereço `0x76`
-- **Sensor SHT31** (temperatura, umidade) — I2C, endereço `0x44`
-- **Divisor de tensão da bateria** — 2× 100 kΩ ligados entre `+V_bat` e GND, ponto médio na GPIO 13
-- **Divisor de tensão do painel solar (6 V)** — 2× 330 kΩ ligados entre `+V_painel` e GND, ponto médio na GPIO 12
+## Hardware
 
-## Esquema de fiação (pinos padrão)
+| Componente | Função | Barramento / pino (padrão em `config.example.h`) |
+|------------|--------|-----------------------------------------------------|
+| BME280 | Pressão (redução barométrica no dispositivo) | I2C `0x76`, SDA GPIO 8, SCL GPIO 9 |
+| SHT31 | Temperatura e umidade | I2C `0x44`, mesmo barramento |
+| INA219 painel | Tensão, corrente e potência do painel solar | I2C `0x40`, SDA GPIO 15, SCL GPIO 16 |
+| INA219 sistema | Tensão, corrente e potência do barramento | I2C `0x41`, mesmo barramento INA |
+| Sensor capacitivo solo 1 | Umidade do solo zona 1 | ADC GPIO 37 |
+| Sensor capacitivo solo 2 | Umidade do solo zona 2 | ADC GPIO 38 |
+| Relé bomba 1 | Irrigação zona 1 | GPIO 35 |
+| Relé bomba 2 | Irrigação zona 2 | GPIO 36 |
 
-| Componente | Pino ESP32-S3 |
-|------------|---------------|
-| BME280 / SHT31 SDA | GPIO 17 |
-| BME280 / SHT31 SCL | GPIO 18 |
-| Divisor bateria (100k/100k) → ponto médio | GPIO 13 (ADC2) |
-| Divisor painel solar (330k/330k) → ponto médio | GPIO 12 (ADC2) |
+> **ADC e Wi-Fi:** leituras de solo e sensores I2C ocorrem no início de cada ciclo, **antes** de ligar o Wi-Fi. Durante irrigação manual com Wi-Fi ativo, o firmware continua amostrando solo e INA a cada `PUMP_SAMPLE_INTERVAL_S`.
 
-> Os dois sensores compartilham o mesmo barramento I2C; cada um responde em seu endereço único (`0x76` BME, `0x44` SHT).
->
-> **Atenção:** GPIO 12 e 13 estão no ADC2 do ESP32-S3, que conflita com o Wi-Fi. O firmware lê as tensões **antes** de ligar o Wi-Fi, então não é necessário tratamento adicional do usuário.
+> **Bombas:** as duas nunca ficam energizadas ao mesmo tempo — `runPump()` desliga o outro relé antes de acionar.
 
-Os pinos e endereços são configuráveis em `include/config.h` (`I2C_SDA_PIN`, `I2C_SCL_PIN`, `BME280_I2C_ADDR`, `SHT31_I2C_ADDR`, `BAT_ADC_PIN`, `SOLAR_ADC_PIN`).
-
-## Cálculo das tensões
-
-Com divisores de relação 1:1 (resistores iguais):
-
-```
-V_bateria = V_pino_13 × 2.0
-V_painel  = V_pino_12 × 2.0
-```
-
-A leitura de tensão usa `analogReadMilliVolts()` (ADC já calibrado pela ROM do ESP32-S3) e faz a média de `ADC_SAMPLES` amostras (default 16).
+Pinos, endereços I2C e calibração do solo são configuráveis em `include/config.h` (copiar de `include/config.example.h`).
 
 ## Requisitos
 
-- [PlatformIO](https://platformio.org/) — CLI ou extensão para VS Code
+- [PlatformIO](https://platformio.org/) — CLI ou extensão VS Code
 
 ## Configuração
-
-1. Copie o template de configuração:
 
 ```bash
 cp include/config.example.h include/config.h
 ```
 
-2. Edite `include/config.h` com suas credenciais:
+Edite `include/config.h`:
 
-- `WIFI_SSID` e `WIFI_PASSWORD` — rede Wi-Fi
-- `API_BASE_URL` — URL base da API (ex: `https://tempo.exemplo.com/api`)
-- `API_TOKEN` — token de autenticação Bearer (deve corresponder ao token configurado na API)
-- `ALTITUDE_LOCAL` — altitude em metros; a pressão ao nível do mar usa redução barométrica isotérmica com a temperatura medida no ciclo (`P_nm = P_local · exp(g·h/(R·T_K))`)
-- `DEEP_SLEEP_SECONDS` — intervalo entre acordes (60 = 1 min)
-- `SAMPLES_PER_API_UPLOAD` — amostras por janela antes do envio (10 = envio a cada 10 min)
-- `BAT_DIVIDER_RATIO` / `SOLAR_DIVIDER_RATIO` — fator de correção do divisor (2.0 para resistores iguais)
+| Constante | Descrição |
+|-----------|-----------|
+| `WIFI_SSID`, `WIFI_PASSWORD` | Rede Wi-Fi |
+| `API_BASE_URL` | URL base da API (ex.: `https://tempo.exemplo.com/api`) |
+| `API_TOKEN` | Deve coincidir com `API_TOKEN` da API |
+| `ALTITUDE_LOCAL` | Altitude (m) para pressão ao nível do mar |
+| `SOIL*_DRY_MV` / `SOIL*_WET_MV` | Calibração dos sensores de solo (mV → %) |
+| `DEEP_SLEEP_SECONDS` | Intervalo entre acordares (60 = 1 min) |
+| `SAMPLES_PER_API_UPLOAD` | Amostras por janela antes do envio (10 ≈ 10 min) |
+| `MANUAL_IRRIGATION_MAX_S` | Teto de segurança por comando manual (s) |
+| `RELAY_ACTIVE_HIGH` | Polaridade do relé (1 = ativo em HIGH) |
 
-Opcional: descomente e preencha `WIFI_STATIC_IP`, `WIFI_GATEWAY`, `WIFI_SUBNET` para usar IP fixo (reduz ~2–3 s de DHCP).
+Opcional: `WIFI_STATIC_IP`, `WIFI_GATEWAY`, `WIFI_SUBNET` para IP fixo.
 
 ## Build e upload
 
 ```bash
-pio run -t upload
-```
-
-## Monitor serial
-
-```bash
+pio run              # compilar
+pio run -t upload    # gravar
 pio device monitor -b 115200
 ```
 
 ## Integração com a API
 
-O firmware envia dados via `POST {API_BASE_URL}/dados` com o header `Authorization: Bearer {API_TOKEN}`.
+### Medições — `POST {API_BASE_URL}/dados`
 
-**Formato do body JSON (todos os campos são opcionais — graceful degradation):**
+Header: `Authorization: Bearer {API_TOKEN}`.
+
+Campos opcionais (graceful degradation — sensores com falha na janela são omitidos):
 
 ```json
 {
-  "temperatura_bme": 25.5,
-  "umidade_bme": 65.2,
-  "temperatura_sht": 25.6,
-  "umidade_sht": 65.0,
+  "temperatura": 25.6,
+  "umidade": 65.0,
   "pressao": 1013.25,
-  "tensao_bateria": 4.05,
-  "tensao_painel": 5.83
+  "umidade_solo_1": 42.0,
+  "umidade_solo_2": 38.5,
+  "tensao_painel": 5.83,
+  "corrente_painel": 0.12,
+  "potencia_painel": 0.70,
+  "tensao_sistema": 4.05,
+  "corrente_sistema": 0.05,
+  "potencia_sistema": 0.20,
+  "tempo_irrigacao_s_1": 10,
+  "tempo_irrigacao_s_2": 0
 }
 ```
 
-Se um sensor falhar durante toda a janela, seus campos correspondentes simplesmente não são incluídos no payload (a API armazena `NULL` para esses campos). Pressão é exclusiva do BME280.
+`temperatura`/`umidade` vêm do SHT31; `pressao` é reduzida ao nível do mar a partir do BME280.
 
-O endpoint e schema esperados estão documentados no projeto da API (Node).
+### Irrigação
 
-## Comportamento
+| Endpoint | Quando |
+|----------|--------|
+| `GET /irrigation/manual/pending` | Todo acordar (após leituras de sensores) |
+| `POST /irrigation/manual/:id/start` | Antes de ligar a bomba |
+| `POST /irrigation/manual/:id/ack` | Após execução |
+| `GET /irrigation/config` | No fim da janela de upload (irrigação automática) |
 
-1. **Acorda** do deep sleep a cada 1 minuto (`DEEP_SLEEP_SECONDS` = 60).
-2. **Lê tensões** (bateria e painel solar) **antes** de qualquer Wi-Fi (ADC2).
-3. **Lê** temperatura, umidade e pressão do BME280; temperatura e umidade do SHT31. Cada sensor é tratado de forma independente — falha de um não impede a coleta do outro.
-4. **Acumula** as leituras na memória RTC (somas e contadores separados por sensor).
-5. A cada **10 acordes** (10 min):
-   - Calcula médias de cada métrica usando apenas amostras válidas daquele sensor (graceful degradation).
-   - Aplica a redução barométrica à pressão usando a temperatura média do BME280.
-   - **Conecta** ao Wi-Fi.
-   - **Envia** as médias em JSON para a API (até 3 tentativas em caso de falha).
-   - Se o envio falhar, persiste o JSON em uma fila NDJSON no LittleFS para retry no próximo wake.
-   - Reinicia a janela de acumulação na RTC.
-6. **Entra em deep sleep** por 60 s e repete.
+Comandos manuais ignoram o flag `active` da zona. Irrigação automática respeita limiar, histerese e `active` da config na API.
+
+## Comportamento do ciclo
+
+1. **Acorda** do deep sleep (`DEEP_SLEEP_SECONDS`, padrão 60 s).
+2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível.
+3. **Lê sensores** (solo, BME280, SHT31, INA219) sem Wi-Fi.
+4. **Verifica irrigação manual** — liga Wi-Fi, consulta `/irrigation/manual/pending`, executa bombas se necessário, confirma com ack.
+5. Se ainda não completou a janela (`SAMPLES_PER_API_UPLOAD`), **volta a dormir**.
+6. Na janela completa:
+   - Calcula médias por sensor com amostras válidas.
+   - Conecta Wi-Fi, aplica irrigação automática conforme config da API.
+   - Envia médias via `POST /dados` (até 3 tentativas).
+   - Em falha de rede ou upload, persiste JSON na fila LittleFS para retry.
+7. **Deep sleep** e repete.
+
+NTP sincroniza relógio para `created_at` em reenvios offline. Ver `pending_queue.cpp` e constantes `PENDING_*` em `config.h`.
