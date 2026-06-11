@@ -59,11 +59,14 @@
 // Tempo maximo de espera pelo host USB-CDC em boot a frio (ms). 0 desabilita.
 #define COLD_BOOT_USB_WAIT_MS       2000
 
-// --- NTP (UTC no RTC para created_at / fila offline) ---
-#define NTP_SERVER_PRIMARY   "pool.ntp.org"
-#define NTP_SERVER_SECONDARY "time.google.com"
-#define NTP_SYNC_WAIT_MS     3500
-#define NTP_MIN_VALID_YEAR   2024
+// --- NTP (horario local para logs e created_at / fila offline) ---
+#define NTP_SERVER_PRIMARY        "pool.ntp.org"
+#define NTP_SERVER_SECONDARY      "time.google.com"
+#define NTP_SYNC_WAIT_MS          3500
+#define NTP_MIN_VALID_YEAR        2024
+// Offset NTP (Brasilia = -10800 s; sem horario de verao).
+#define NTP_GMT_OFFSET_SEC        (-3 * 3600)
+#define NTP_DAYLIGHT_OFFSET_SEC   0
 
 // --- Fila offline (LittleFS) ---
 // Maximo de POSTs por acordar ao drenar a fila (evita WiFi ligado demais).

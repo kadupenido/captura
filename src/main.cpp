@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <esp_sleep.h>
 #include <Adafruit_Sensor.h>
@@ -13,6 +14,7 @@
 #include <Adafruit_INA219.h>
 
 #include "config.h"
+#include "log.h"
 #include "pending_queue.h"
 
 #ifndef SAMPLES_PER_API_UPLOAD
@@ -46,6 +48,12 @@
 #endif
 #ifndef NTP_MIN_VALID_YEAR
 #define NTP_MIN_VALID_YEAR 2024
+#endif
+#ifndef NTP_GMT_OFFSET_SEC
+#define NTP_GMT_OFFSET_SEC (-3 * 3600)
+#endif
+#ifndef NTP_DAYLIGHT_OFFSET_SEC
+#define NTP_DAYLIGHT_OFFSET_SEC 0
 #endif
 
 #define RTC_MAGIC 0x4D455449  // "METI" meteo dual
@@ -184,7 +192,7 @@ void enterDeepSleep() {
   Wire.end();
   Wire1.end();
   esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
-  Serial.printf("Entrando em deep sleep por %d segundos...\n", DEEP_SLEEP_SECONDS);
+  logPrintf("Entrando em deep sleep por %d segundos...\n", DEEP_SLEEP_SECONDS);
   Serial.flush();
   delay(50);
   esp_deep_sleep_start();
@@ -228,29 +236,28 @@ static void trySyncTimeFromNtp() {
   if (wallClockLooksSynced()) {
     return;
   }
-  configTime(0, 0, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
   const uint32_t start = millis();
   while (millis() - start < static_cast<uint32_t>(NTP_SYNC_WAIT_MS) && WiFi.status() == WL_CONNECTED) {
     if (wallClockLooksSynced()) {
-      Serial.printf("NTP: sincronizado.\n");
+      logPrintf("NTP: sincronizado.\n");
       return;
     }
     delay(100);
   }
-  Serial.printf("NTP: timeout (RTC pode estar invalido neste wake).\n");
+  logPrintf("NTP: timeout (RTC pode estar invalido neste wake).\n");
 }
 
 static void appendCreatedAtUtcIfSynced(JsonDocument& doc) {
   if (!wallClockLooksSynced()) {
     return;
   }
-  const time_t now = time(nullptr);
   struct tm t {};
-  if (!gmtime_r(&now, &t)) {
+  if (!getLocalTime(&t, 0)) {
     return;
   }
   char buf[32];
-  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t) == 0) {
+  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t) == 0) {
     return;
   }
   doc["created_at"] = buf;
@@ -287,7 +294,7 @@ int sendData(const char* payload, size_t payloadLen) {
   // HTTPClient::POST exige ponteiro mutavel; o buffer nao e alterado pelo cliente.
   int code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(payload)), payloadLen);
   if (code != 201) {
-    Serial.printf("Erro HTTP %d: %s\n", code, http.getString().c_str());
+    logPrintf("Erro HTTP %d: %s\n", code, http.getString().c_str());
   }
   http.end();
   return code;
@@ -296,10 +303,10 @@ int sendData(const char* payload, size_t payloadLen) {
 int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
   int lastCode = -1;
   for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
-    Serial.printf("Envio tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
+    logPrintf("Envio tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
     lastCode = sendData(payload, payloadLen);
     if (lastCode == 201) {
-      Serial.printf("Dados enviados com sucesso.\n");
+      logPrintf("Dados enviados com sucesso.\n");
       return 201;
     }
     if (attempt < HTTP_MAX_RETRIES) {
@@ -345,7 +352,7 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
   http.addHeader("Authorization", "Bearer " API_TOKEN);
   const int code = http.GET();
   if (code != 200) {
-    Serial.printf("Irrigacao: GET /irrigation/config falhou (%d).\n", code);
+    logPrintf("Irrigacao: GET /irrigation/config falhou (%d).\n", code);
     http.end();
     return false;
   }
@@ -356,7 +363,7 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, body);
   if (err) {
-    Serial.printf("Irrigacao: JSON invalido em /irrigation/config (%s).\n", err.c_str());
+    logPrintf("Irrigacao: JSON invalido em /irrigation/config (%s).\n", err.c_str());
     return false;
   }
 
@@ -364,7 +371,7 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
   bool ok2 = parseZoneConfig(doc["zone_2"], cfg.zone2);
   cfg.valid = ok1 && ok2;
   if (!cfg.valid) {
-    Serial.printf("Irrigacao: configuracao incompleta.\n");
+    logPrintf("Irrigacao: configuracao incompleta.\n");
   }
   return cfg.valid;
 }
@@ -375,9 +382,10 @@ struct ManualCommand {
   int32_t id = 0;
   int zone = 0;
   int durationS = 0;
+  char status[12] = "pending";
 };
 
-// Busca comandos manuais pendentes. Retorna -1 em falha, ou 0..2 comandos em out (ordem por zona).
+// Busca comandos manuais ativos (pending ou running). Retorna -1 em falha, ou 0..2 em out.
 static int fetchPendingManualCommands(ManualCommand out[2]) {
   char url[192];
   snprintf(url, sizeof(url), "%s/irrigation/manual/pending", API_BASE_URL);
@@ -388,7 +396,7 @@ static int fetchPendingManualCommands(ManualCommand out[2]) {
   http.addHeader("Authorization", "Bearer " API_TOKEN);
   const int code = http.GET();
   if (code != 200) {
-    Serial.printf("Irrigacao manual: GET /irrigation/manual/pending falhou (%d).\n", code);
+    logPrintf("Irrigacao manual: GET /irrigation/manual/pending falhou (%d).\n", code);
     http.end();
     return -1;
   }
@@ -399,13 +407,13 @@ static int fetchPendingManualCommands(ManualCommand out[2]) {
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, body);
   if (err) {
-    Serial.printf("Irrigacao manual: JSON invalido (%s).\n", err.c_str());
+    logPrintf("Irrigacao manual: JSON invalido (%s).\n", err.c_str());
     return -1;
   }
 
   JsonArray commands = doc["commands"].as<JsonArray>();
   if (commands.isNull()) {
-    Serial.printf("Irrigacao manual: resposta sem campo commands.\n");
+    logPrintf("Irrigacao manual: resposta sem campo commands.\n");
     return -1;
   }
 
@@ -418,15 +426,47 @@ static int fetchPendingManualCommands(ManualCommand out[2]) {
     const int zone = item["zone"] | 0;
     const int durationS = item["duration_s"] | 0;
     if (id <= 0 || (zone != 1 && zone != 2) || durationS < 1) {
-      Serial.printf("Irrigacao manual: comando invalido ignorado.\n");
+      logPrintf("Irrigacao manual: comando invalido ignorado.\n");
       continue;
     }
+    const char* status = item["status"] | "pending";
     out[n].id = id;
     out[n].zone = zone;
     out[n].durationS = durationS;
+    strncpy(out[n].status, status, sizeof(out[n].status) - 1);
+    out[n].status[sizeof(out[n].status) - 1] = '\0';
     n++;
   }
   return n;
+}
+
+// Marca inicio na API antes de acionar a bomba (pending -> running).
+static bool startManualCommand(int32_t id) {
+  char url[192];
+  snprintf(url, sizeof(url), "%s/irrigation/manual/%ld/start", API_BASE_URL, (long)id);
+
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Authorization", "Bearer " API_TOKEN);
+    const int code = http.POST(nullptr, 0);
+    http.end();
+    if (code == 200) {
+      logPrintf("Irrigacao manual: inicio do comando %ld confirmado.\n", (long)id);
+      return true;
+    }
+    if (code == 404 || code == 409) {
+      logPrintf("Irrigacao manual: start do comando %ld respondeu %d; tratado como iniciado.\n",
+                    (long)id, code);
+      return true;
+    }
+    logPrintf("Irrigacao manual: start tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
+    if (attempt < HTTP_MAX_RETRIES) {
+      delay(2000);
+    }
+  }
+  return false;
 }
 
 // Confirma execucao na API. 404/409 sao terminais: o comando deixou de estar
@@ -446,15 +486,15 @@ static bool ackManualCommand(int32_t id, int executedS) {
     const int code = http.POST(reinterpret_cast<uint8_t*>(body), strlen(body));
     http.end();
     if (code == 200) {
-      Serial.printf("Irrigacao manual: ack do comando %ld confirmado.\n", (long)id);
+      logPrintf("Irrigacao manual: ack do comando %ld confirmado.\n", (long)id);
       return true;
     }
     if (code == 404 || code == 409) {
-      Serial.printf("Irrigacao manual: ack do comando %ld respondeu %d; tratado como concluido.\n",
+      logPrintf("Irrigacao manual: ack do comando %ld respondeu %d; tratado como concluido.\n",
                     (long)id, code);
       return true;
     }
-    Serial.printf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
+    logPrintf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
     if (attempt < HTTP_MAX_RETRIES) {
       delay(2000);
     }
@@ -466,7 +506,7 @@ static bool ackManualCommand(int32_t id, int executedS) {
 // Deve rodar APOS as leituras de ADC/sensores (restricao ADC2 x WiFi).
 static void processManualIrrigation() {
   if (!ensureWiFi()) {
-    Serial.printf("Irrigacao manual: WiFi indisponivel; verificacao ignorada.\n");
+    logPrintf("Irrigacao manual: WiFi indisponivel; verificacao ignorada.\n");
     return;
   }
 
@@ -479,15 +519,27 @@ static void processManualIrrigation() {
   for (int i = 0; i < n; i++) {
     const ManualCommand& cmd = cmds[i];
     int32_t& lastId = (cmd.zone == 1) ? rtc_last_manual_id_1 : rtc_last_manual_id_2;
-    if (cmd.id == lastId) {
-      // Ja executado em wake anterior; ack se perdeu — apenas reenvia.
-      Serial.printf("Irrigacao manual: comando %ld (zona %d) ja executado; reenviando ack.\n",
+    const bool isRunning = strcmp(cmd.status, "running") == 0;
+
+    if (cmd.id == lastId || isRunning) {
+      logPrintf("Irrigacao manual: comando %ld (zona %d) ja executado; reenviando ack.\n",
                     (long)cmd.id, cmd.zone);
+      ensureWiFi();
       ackManualCommand(cmd.id, cmd.durationS);
+      if (cmd.id != lastId) {
+        lastId = cmd.id;
+      }
       continue;
     }
+
+    if (!startManualCommand(cmd.id)) {
+      logPrintf("Irrigacao manual: start do comando %ld falhou; bomba nao acionada.\n",
+                    (long)cmd.id);
+      continue;
+    }
+
     const int relayPin = (cmd.zone == 1) ? RELAY_PIN_1 : RELAY_PIN_2;
-    Serial.printf("Irrigacao manual: acionando bomba da zona %d por %d s (comando %ld).\n",
+    logPrintf("Irrigacao manual: acionando bomba da zona %d por %d s (comando %ld).\n",
                   cmd.zone, cmd.durationS, (long)cmd.id);
     const int ranS = runPump(relayPin, cmd.durationS);
     if (cmd.zone == 1) {
@@ -496,6 +548,7 @@ static void processManualIrrigation() {
       rtc_manual_irrig_s_2 += static_cast<uint16_t>(ranS);
     }
     lastId = cmd.id;
+    ensureWiFi();
     ackManualCommand(cmd.id, ranS);
   }
 }
@@ -522,7 +575,7 @@ static int maybeIrrigateZone(int relayPin, float soilPct, IrrigationZoneConfig c
     return 0;
   }
   if (!cfg.active) {
-    Serial.printf("Irrigacao: zona desabilitada (GPIO %d); bomba nao acionada.\n", relayPin);
+    logPrintf("Irrigacao: zona desabilitada (GPIO %d); bomba nao acionada.\n", relayPin);
     return 0;
   }
 
@@ -533,7 +586,7 @@ static int maybeIrrigateZone(int relayPin, float soilPct, IrrigationZoneConfig c
   }
 
   if (armed && soilPct < cfg.thresholdPct && cfg.pumpDurationS > 0) {
-    Serial.printf("Irrigacao: acionando rele GPIO %d por %d s (solo=%.1f%%, limiar=%.1f%%).\n",
+    logPrintf("Irrigacao: acionando rele GPIO %d por %d s (solo=%.1f%%, limiar=%.1f%%).\n",
                   relayPin, cfg.pumpDurationS, soilPct, cfg.thresholdPct);
     const int ranS = runPump(relayPin, cfg.pumpDurationS);
     armed = false;
@@ -576,7 +629,7 @@ void runCycle() {
       rtc_count_press++;
       bmeReadOk = true;
     } else {
-      Serial.printf("Leitura invalida do BME280 (NaN).\n");
+      logPrintf("Leitura invalida do BME280 (NaN).\n");
     }
   }
 
@@ -592,7 +645,7 @@ void runCycle() {
       rtc_count_temp_hum++;
       shtReadOk = true;
     } else {
-      Serial.printf("Leitura invalida do SHT31 (NaN).\n");
+      logPrintf("Leitura invalida do SHT31 (NaN).\n");
     }
   }
 
@@ -614,7 +667,7 @@ void runCycle() {
       rtc_count_painel++;
       inaPainelReadOk = true;
     } else {
-      Serial.printf("Leitura invalida do INA219 painel (NaN).\n");
+      logPrintf("Leitura invalida do INA219 painel (NaN).\n");
     }
   }
   if (s_inaSistemaOk) {
@@ -628,13 +681,13 @@ void runCycle() {
       rtc_count_sistema++;
       inaSistemaReadOk = true;
     } else {
-      Serial.printf("Leitura invalida do INA219 sistema (NaN).\n");
+      logPrintf("Leitura invalida do INA219 sistema (NaN).\n");
     }
   }
 
   rtc_total_samples++;
 
-  Serial.printf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
+  logPrintf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
                 rtc_total_samples, (int)SAMPLES_PER_API_UPLOAD,
                 bmeReadOk ? pSeaBme : NAN,
                 shtReadOk ? temperatura : NAN,
@@ -645,7 +698,7 @@ void runCycle() {
                 inaSistemaReadOk ? vSistema : NAN,
                 inaSistemaReadOk ? iSistema : NAN,
                 inaSistemaReadOk ? pSistema : NAN);
-  Serial.printf("Solo Z1:%.1f%% Z2:%.1f%%\n", soil1, soil2);
+  logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", soil1, soil2);
 
   // Comandos manuais sao verificados em todo wake (apos leituras de ADC/sensores).
   processManualIrrigation();
@@ -683,40 +736,40 @@ void runCycle() {
   }
 
   if (doc.size() == 0) {
-    Serial.printf("Janela sem nenhuma medicao valida; descartando.\n");
+    logPrintf("Janela sem nenhuma medicao valida; descartando.\n");
     wifiOffIfConnected();
     resetRtcWindow();
     return;
   }
 
-  Serial.printf("Janela completa (TH=%d Press=%d Painel=%d Sistema=%d amostras validas em %d wakes).\n",
+  logPrintf("Janela completa (TH=%d Press=%d Painel=%d Sistema=%d amostras validas em %d wakes).\n",
                 rtc_count_temp_hum, rtc_count_press, rtc_count_painel, rtc_count_sistema, rtc_total_samples);
 
   const bool wifiUp = ensureWiFi();
 
   if (!wifiUp) {
-    Serial.printf("Falha ao conectar WiFi; gravando na fila local.\n");
+    logPrintf("Falha ao conectar WiFi; gravando na fila local.\n");
     doc["tempo_irrigacao_s_1"] = rtc_manual_irrig_s_1;
     doc["tempo_irrigacao_s_2"] = rtc_manual_irrig_s_2;
     appendCreatedAtUtcIfSynced(doc);
     char payloadOffline[768];
     size_t nOffline = serializeJson(doc, payloadOffline, sizeof(payloadOffline));
     if (nOffline == 0 || nOffline >= sizeof(payloadOffline)) {
-      Serial.printf("Erro: JSON excede buffer ou serializacao falhou.\n");
+      logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
       wifiOffIfConnected();
       resetRtcWindow();
       return;
     }
     if (s_littlefsOk && !pendingQueueAppend(payloadOffline)) {
-      Serial.printf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
     } else if (!s_littlefsOk) {
-      Serial.printf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
+      logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
     wifiOffIfConnected();
     resetRtcWindow();
     return;
   }
-  Serial.printf("WiFi conectado.\n");
+  logPrintf("WiFi conectado.\n");
 
   int irrigationSeconds1 = 0;
   int irrigationSeconds2 = 0;
@@ -731,7 +784,7 @@ void runCycle() {
     irrigationSeconds1 = maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1, rtc_irrigation_armed_1);
     irrigationSeconds2 = maybeIrrigateZone(RELAY_PIN_2, soilDecision2, irrigationCfg.zone2, rtc_irrigation_armed_2);
   } else {
-    Serial.printf("Irrigacao: mantendo bombas desligadas por falta de configuracao.\n");
+    logPrintf("Irrigacao: mantendo bombas desligadas por falta de configuracao.\n");
   }
   setRelayState(RELAY_PIN_1, false);
   setRelayState(RELAY_PIN_2, false);
@@ -743,18 +796,18 @@ void runCycle() {
   char payload[768];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   if (n == 0 || n >= sizeof(payload)) {
-    Serial.printf("Erro: JSON excede buffer ou serializacao falhou.\n");
+    logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
     wifiOffIfConnected();
     resetRtcWindow();
     return;
   }
 
   if (sendPayloadWithRetries(payload, n) != 201) {
-    Serial.printf("Falha ao enviar dados apos todas as tentativas; gravando na fila local.\n");
+    logPrintf("Falha ao enviar dados apos todas as tentativas; gravando na fila local.\n");
     if (s_littlefsOk && !pendingQueueAppend(payload)) {
-      Serial.printf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
     } else if (!s_littlefsOk) {
-      Serial.printf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
+      logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
   }
 
@@ -781,7 +834,7 @@ void setup() {
     }
   }
 
-  Serial.printf("Acordando... (cause=%d)\n", static_cast<int>(wakeCause));
+  logPrintf("Acordando... (cause=%d)\n", static_cast<int>(wakeCause));
 
   s_littlefsOk = pendingQueueInit();
 
@@ -795,7 +848,7 @@ void setup() {
 
   s_bmeOk = bme.begin(BME280_I2C_ADDR, &Wire);
   if (!s_bmeOk) {
-    Serial.printf("BME280 nao encontrado no endereco 0x%02X.\n", (unsigned)BME280_I2C_ADDR);
+    logPrintf("BME280 nao encontrado no endereco 0x%02X.\n", (unsigned)BME280_I2C_ADDR);
   } else {
     bme.setSampling(Adafruit_BME280::MODE_FORCED,
                     Adafruit_BME280::SAMPLING_X1,
@@ -807,20 +860,20 @@ void setup() {
 
   s_shtOk = sht31.begin(SHT31_I2C_ADDR);
   if (!s_shtOk) {
-    Serial.printf("SHT31 nao encontrado no endereco 0x%02X.\n", (unsigned)SHT31_I2C_ADDR);
+    logPrintf("SHT31 nao encontrado no endereco 0x%02X.\n", (unsigned)SHT31_I2C_ADDR);
   }
 
   s_inaPainelOk = inaPainel.begin(&Wire1);
   if (!s_inaPainelOk) {
-    Serial.printf("INA219 painel nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_PAINEL_ADDR);
+    logPrintf("INA219 painel nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_PAINEL_ADDR);
   }
   s_inaSistemaOk = inaSistema.begin(&Wire1);
   if (!s_inaSistemaOk) {
-    Serial.printf("INA219 sistema nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_SISTEMA_ADDR);
+    logPrintf("INA219 sistema nao encontrado no endereco 0x%02X.\n", (unsigned)INA219_SISTEMA_ADDR);
   }
 
   if (!s_bmeOk && !s_shtOk && !s_inaPainelOk && !s_inaSistemaOk) {
-    Serial.printf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
+    logPrintf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
     enterDeepSleep();
     return;
   }
@@ -837,13 +890,13 @@ void setup() {
   }
 
   if (!s_littlefsOk) {
-    Serial.printf("Aviso: fila offline indisponivel (LittleFS).\n");
+    logPrintf("Aviso: fila offline indisponivel (LittleFS).\n");
   } else if (pendingQueueHasPending()) {
     int pending = pendingQueueCount();
     if (pending >= 0) {
-      Serial.printf("Fila offline: %d item(ns) pendente(s); tentando enviar...\n", pending);
+      logPrintf("Fila offline: %d item(ns) pendente(s); tentando enviar...\n", pending);
     } else {
-      Serial.printf("Fila offline: itens pendentes; tentando enviar...\n");
+      logPrintf("Fila offline: itens pendentes; tentando enviar...\n");
     }
     if (ensureWiFi()) {
       int n = pendingQueueFlush(PENDING_FLUSH_MAX_PER_WAKE, sendPayloadWithRetriesForQueue);
@@ -853,19 +906,19 @@ void setup() {
       }
       if (n > 0) {
         if (remaining >= 0) {
-          Serial.printf("Fila: enviados %d; restam %d.\n", n, remaining);
+          logPrintf("Fila: enviados %d; restam %d.\n", n, remaining);
         } else {
-          Serial.printf("Fila: enviados %d registro(s) pendente(s).\n", n);
+          logPrintf("Fila: enviados %d registro(s) pendente(s).\n", n);
         }
       } else if (remaining > 0) {
-        Serial.printf("Fila: nada enviado; restam %d.\n", remaining);
+        logPrintf("Fila: nada enviado; restam %d.\n", remaining);
       }
     } else {
-      Serial.printf("Fila: WiFi indisponivel; pendencias permanecem na flash.\n");
+      logPrintf("Fila: WiFi indisponivel; pendencias permanecem na flash.\n");
       wifiOffIfConnected();
     }
   } else {
-    Serial.printf("Fila offline: vazia.\n");
+    logPrintf("Fila offline: vazia.\n");
   }
 
   // O envio da fila pode ter ligado o WiFi; desliga antes de seguir o ciclo.

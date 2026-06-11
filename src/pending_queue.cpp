@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 
 #include "config.h"
+#include "log.h"
 
 #ifndef PENDING_MAX_BYTES
 #define PENDING_MAX_BYTES 262144
@@ -116,7 +117,7 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
   }
 
   while (s_lineCountValid && s_pendingLineCount >= PENDING_MAX_LINES) {
-    Serial.printf("Fila: descartando linha mais antiga (limite %d linhas).\n", (int)PENDING_MAX_LINES);
+    logPrintf("Fila: descartando linha mais antiga (limite %d linhas).\n", (int)PENDING_MAX_LINES);
     if (!removeFirstLine()) {
       return false;
     }
@@ -128,7 +129,7 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
     if (fsz + add <= (size_t)PENDING_MAX_BYTES) {
       break;
     }
-    Serial.printf("Fila: descartando linha mais antiga (limite %d bytes).\n", (int)PENDING_MAX_BYTES);
+    logPrintf("Fila: descartando linha mais antiga (limite %d bytes).\n", (int)PENDING_MAX_BYTES);
     if (!removeFirstLine()) {
       return false;
     }
@@ -144,9 +145,9 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
 
   if (s_lineCountValid) {
     s_pendingLineCount++;
-    Serial.printf("Fila offline: gravado (total %d).\n", s_pendingLineCount);
+    logPrintf("Fila offline: gravado (total %d).\n", s_pendingLineCount);
   } else {
-    Serial.printf("Fila offline: gravado.\n");
+    logPrintf("Fila offline: gravado.\n");
   }
   return true;
 }
@@ -156,9 +157,9 @@ bool pendingQueueInit() {
   s_pendingLineCount = 0;
 
   if (!LittleFS.begin(false)) {
-    Serial.printf("LittleFS: montagem falhou, formatando...\n");
+    logPrintf("LittleFS: montagem falhou, formatando...\n");
     if (!LittleFS.begin(true)) {
-      Serial.printf("LittleFS: formatacao falhou.\n");
+      logPrintf("LittleFS: formatacao falhou.\n");
       return false;
     }
   }
@@ -171,7 +172,7 @@ bool pendingQueueInit() {
   // Garante ficheiro da fila sem usar exists() (evita log de erro no VFS).
   File touch = LittleFS.open(kPendingPath, "a", true);
   if (!touch) {
-    Serial.printf("LittleFS: nao foi possivel criar pending.ndjson.\n");
+    logPrintf("LittleFS: nao foi possivel criar pending.ndjson.\n");
     return false;
   }
   touch.close();
@@ -179,9 +180,9 @@ bool pendingQueueInit() {
   s_pendingLineCount = countLinesFromFile();
   s_lineCountValid = true;
   if (s_pendingLineCount > 0) {
-    Serial.printf("Fila offline: %d item(ns) pendente(s) na flash.\n", s_pendingLineCount);
+    logPrintf("Fila offline: %d item(ns) pendente(s) na flash.\n", s_pendingLineCount);
   } else {
-    Serial.printf("Fila offline: vazia.\n");
+    logPrintf("Fila offline: vazia.\n");
   }
   return true;
 }
