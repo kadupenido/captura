@@ -256,12 +256,13 @@ static void appendCreatedAtUtcIfSynced(JsonDocument& doc) {
   if (!wallClockLooksSynced()) {
     return;
   }
-  struct tm t {};
-  if (!getLocalTime(&t, 0)) {
+  const time_t now = time(nullptr);
+  struct tm* t = gmtime(&now);
+  if (t == nullptr) {
     return;
   }
   char buf[32];
-  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t) == 0) {
+  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", t) == 0) {
     return;
   }
   doc["created_at"] = buf;

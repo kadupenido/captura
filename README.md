@@ -111,4 +111,4 @@ Comandos manuais ignoram o flag `active` da zona. Irrigação automática respei
    - Em falha de rede ou upload, persiste JSON na fila LittleFS para retry.
 7. **Deep sleep** e repete.
 
-NTP sincroniza relógio para `created_at` em reenvios offline. Ver `pending_queue.cpp` e constantes `PENDING_*` em `config.h`.
+NTP sincroniza relógio; `created_at` nos payloads é enviado em **UTC com sufixo `Z`** (ex.: `2025-06-10T17:30:00Z`). Reenvios offline preservam o timestamp original na fila. Ver `pending_queue.cpp` e constantes `PENDING_*` em `config.h`.
