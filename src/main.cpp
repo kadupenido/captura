@@ -399,6 +399,7 @@ struct SensorSnapshot {
 };
 
 static SensorSnapshot accumulateSensorSample();
+static void uploadSnapshotNow(const SensorSnapshot& snap);
 static int runPump(int relayPin, int durationS);
 
 struct ManualCommand {
@@ -600,12 +601,14 @@ static int runPump(int relayPin, int durationS) {
       const SensorSnapshot snap = accumulateSensorSample();
       logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
                     snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
+      uploadSnapshotNow(snap);
     }
   }
 
   setRelayState(relayPin, false);
   const SensorSnapshot postSnap = accumulateSensorSample();
   logPrintf("Irrigacao: amostra pos-bomba (solo Z1:%.1f%% Z2:%.1f%%)\n", postSnap.soil1, postSnap.soil2);
+  uploadSnapshotNow(postSnap);
   return durationS;
 }
 
@@ -715,6 +718,68 @@ static SensorSnapshot accumulateSensorSample() {
   }
 
   return snap;
+}
+
+static bool appendSnapshotToJson(const SensorSnapshot& snap, JsonDocument& doc) {
+  doc.clear();
+  if (snap.shtReadOk) {
+    doc["temperatura"] = roundTo2(snap.temperatura);
+    doc["umidade"] = roundTo2(snap.umidade);
+  }
+  if (snap.bmeReadOk) {
+    doc["pressao"] = roundTo2(snap.pSeaBme);
+  }
+  if (snap.inaPainelReadOk) {
+    doc["tensao_painel"] = roundTo2(snap.vPainel);
+    doc["corrente_painel"] = roundTo2(snap.iPainel);
+    doc["potencia_painel"] = roundTo2(snap.pPainel);
+  }
+  if (snap.inaSistemaReadOk) {
+    doc["tensao_sistema"] = roundTo2(snap.vSistema);
+    doc["corrente_sistema"] = roundTo2(snap.iSistema);
+    doc["potencia_sistema"] = roundTo2(snap.pSistema);
+  }
+  if (!isnan(snap.soil1)) {
+    doc["umidade_solo_1"] = roundTo2(snap.soil1);
+  }
+  if (!isnan(snap.soil2)) {
+    doc["umidade_solo_2"] = roundTo2(snap.soil2);
+  }
+  return doc.size() > 0;
+}
+
+static void uploadSnapshotNow(const SensorSnapshot& snap) {
+  JsonDocument doc;
+  if (!appendSnapshotToJson(snap, doc)) {
+    return;
+  }
+  appendCreatedAtUtcIfSynced(doc);
+
+  char payload[768];
+  const size_t n = serializeJson(doc, payload, sizeof(payload));
+  if (n == 0 || n >= sizeof(payload)) {
+    logPrintf("Erro: JSON snapshot excede buffer ou serializacao falhou.\n");
+    return;
+  }
+
+  if (!ensureWiFi()) {
+    logPrintf("Irrigacao: WiFi indisponivel; gravando snapshot na fila local.\n");
+    if (s_littlefsOk && !pendingQueueAppend(payload)) {
+      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+    } else if (!s_littlefsOk) {
+      logPrintf("Fila local: LittleFS indisponivel; snapshot nao salvo.\n");
+    }
+    return;
+  }
+
+  if (sendPayloadWithRetries(payload, n) != 201) {
+    logPrintf("Irrigacao: falha ao enviar snapshot; gravando na fila local.\n");
+    if (s_littlefsOk && !pendingQueueAppend(payload)) {
+      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+    } else if (!s_littlefsOk) {
+      logPrintf("Fila local: LittleFS indisponivel; snapshot nao salvo.\n");
+    }
+  }
 }
 
 void runCycle() {

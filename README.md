@@ -102,6 +102,7 @@ Comandos manuais ignoram o flag `active` da zona. Irrigação automática respei
 2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível.
 3. **Lê sensores** (solo, BME280, SHT31, INA219) sem Wi-Fi.
 4. **Verifica irrigação manual** — liga Wi-Fi, consulta `/irrigation/manual/pending`, executa bombas se necessário, confirma com ack.
+   - **Durante a irrigação** (manual ou automática): a cada `PUMP_SAMPLE_INTERVAL_S` e na amostra pós-bomba, envia leitura instantânea via `POST /dados` (sem esperar a janela de upload). Falhas vão para a fila LittleFS.
 5. Se ainda não completou a janela (`SAMPLES_PER_API_UPLOAD`), **volta a dormir**.
 6. Na janela completa:
    - Calcula médias por sensor com amostras válidas.
