@@ -605,6 +605,8 @@ void runCycle() {
     vPainel = inaPainel.getBusVoltage_V();
     iPainel = inaPainel.getCurrent_mA();
     pPainel = inaPainel.getPower_mW();
+    if (iPainel < 0.0f) iPainel = 0.0f;
+    if (pPainel < 0.0f) pPainel = 0.0f;
     if (!isnan(vPainel) && !isnan(iPainel) && !isnan(pPainel)) {
       rtc_sum_vpainel += vPainel;
       rtc_sum_ipainel += iPainel;
