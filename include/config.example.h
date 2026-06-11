@@ -44,6 +44,8 @@
 #define SOIL2_WET_MV        1200.0f
 // Teto de seguranca por comando de irrigacao manual (s).
 #define MANUAL_IRRIGATION_MAX_S   600
+// Intervalo de leitura dos sensores enquanto a bomba esta ligada (s).
+#define PUMP_SAMPLE_INTERVAL_S    10
 
 // --- Pressão atmosférica ---
 #define ALTITUDE_LOCAL     1000  // Altitude em metros para correcao barometrica

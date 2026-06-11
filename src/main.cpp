@@ -37,6 +37,10 @@
 #define MANUAL_IRRIGATION_MAX_S 600
 #endif
 
+#ifndef PUMP_SAMPLE_INTERVAL_S
+#define PUMP_SAMPLE_INTERVAL_S 10
+#endif
+
 #ifndef NTP_SERVER_PRIMARY
 #define NTP_SERVER_PRIMARY "pool.ntp.org"
 #endif
@@ -376,6 +380,25 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
   return cfg.valid;
 }
 
+struct SensorSnapshot {
+  float soil1 = NAN;
+  float soil2 = NAN;
+  bool bmeReadOk = false;
+  bool shtReadOk = false;
+  bool inaPainelReadOk = false;
+  bool inaSistemaReadOk = false;
+  float pSeaBme = NAN;
+  float temperatura = NAN;
+  float umidade = NAN;
+  float vPainel = NAN;
+  float iPainel = NAN;
+  float pPainel = NAN;
+  float vSistema = NAN;
+  float iSistema = NAN;
+  float pSistema = NAN;
+};
+
+static SensorSnapshot accumulateSensorSample();
 static int runPump(int relayPin, int durationS);
 
 struct ManualCommand {
@@ -503,7 +526,8 @@ static bool ackManualCommand(int32_t id, int executedS) {
 }
 
 // Verifica e executa comandos manuais em todo wake (liga WiFi se preciso).
-// Deve rodar APOS as leituras de ADC/sensores (restricao ADC2 x WiFi).
+// A leitura inicial do wake ocorre antes do WiFi; runPump() continua amostrando
+// solo e sensores I2C a cada PUMP_SAMPLE_INTERVAL_S com WiFi ativo.
 static void processManualIrrigation() {
   if (!ensureWiFi()) {
     logPrintf("Irrigacao manual: WiFi indisponivel; verificacao ignorada.\n");
@@ -565,8 +589,23 @@ static int runPump(int relayPin, int durationS) {
   const int otherPin = (relayPin == RELAY_PIN_1) ? RELAY_PIN_2 : RELAY_PIN_1;
   setRelayState(otherPin, false);
   setRelayState(relayPin, true);
-  delay(static_cast<uint32_t>(durationS) * 1000UL);
+
+  const uint32_t intervalMs = static_cast<uint32_t>(PUMP_SAMPLE_INTERVAL_S) * 1000UL;
+  uint32_t remainingMs = static_cast<uint32_t>(durationS) * 1000UL;
+  while (remainingMs > 0) {
+    const uint32_t stepMs = min(remainingMs, intervalMs);
+    delay(stepMs);
+    remainingMs -= stepMs;
+    if (remainingMs > 0) {
+      const SensorSnapshot snap = accumulateSensorSample();
+      logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
+                    snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
+    }
+  }
+
   setRelayState(relayPin, false);
+  const SensorSnapshot postSnap = accumulateSensorSample();
+  logPrintf("Irrigacao: amostra pos-bomba (solo Z1:%.1f%% Z2:%.1f%%)\n", postSnap.soil1, postSnap.soil2);
   return durationS;
 }
 
@@ -602,103 +641,99 @@ static float roundTo2(float v) {
   return roundf(v * 100.0f) / 100.0f;
 }
 
-void runCycle() {
-  // 1) Le umidade do solo.
-  float soil1 = readSoilPercent(SOIL_ADC_PIN_1, SOIL1_DRY_MV, SOIL1_WET_MV);
-  float soil2 = readSoilPercent(SOIL_ADC_PIN_2, SOIL2_DRY_MV, SOIL2_WET_MV);
-  if (!isnan(soil1)) {
-    rtc_sum_soil_1 += soil1;
+static SensorSnapshot accumulateSensorSample() {
+  SensorSnapshot snap;
+
+  snap.soil1 = readSoilPercent(SOIL_ADC_PIN_1, SOIL1_DRY_MV, SOIL1_WET_MV);
+  snap.soil2 = readSoilPercent(SOIL_ADC_PIN_2, SOIL2_DRY_MV, SOIL2_WET_MV);
+  if (!isnan(snap.soil1)) {
+    rtc_sum_soil_1 += snap.soil1;
     rtc_count_soil_1++;
   }
-  if (!isnan(soil2)) {
-    rtc_sum_soil_2 += soil2;
+  if (!isnan(snap.soil2)) {
+    rtc_sum_soil_2 += snap.soil2;
     rtc_count_soil_2++;
   }
 
-  // 2) BME280: somente pressao (corrigida para nivel do mar com temperatura do SHT31).
-  bool bmeReadOk = false;
-  float pLocalBme = NAN, pSeaBme = NAN;
   if (s_bmeOk) {
     bme.takeForcedMeasurement();
-    pLocalBme = bme.readPressure() / 100.0F;
+    const float pLocalBme = bme.readPressure() / 100.0F;
     if (!isnan(pLocalBme)) {
       const float tempRefC = (rtc_count_temp_hum > 0) ? (rtc_sum_temp / rtc_count_temp_hum) : 25.0f;
-      float tKelvin = tempRefC + 273.15f;
-      pSeaBme = pLocalBme * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
-      rtc_sum_press += pSeaBme;
+      const float tKelvin = tempRefC + 273.15f;
+      snap.pSeaBme = pLocalBme * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
+      rtc_sum_press += snap.pSeaBme;
       rtc_count_press++;
-      bmeReadOk = true;
+      snap.bmeReadOk = true;
     } else {
       logPrintf("Leitura invalida do BME280 (NaN).\n");
     }
   }
 
-  // 3) SHT31: temperatura e umidade (fonte unica).
-  bool shtReadOk = false;
-  float temperatura = NAN, umidade = NAN;
   if (s_shtOk) {
-    temperatura = sht31.readTemperature();
-    umidade = sht31.readHumidity();
-    if (!isnan(temperatura) && !isnan(umidade)) {
-      rtc_sum_temp += temperatura;
-      rtc_sum_hum += umidade;
+    snap.temperatura = sht31.readTemperature();
+    snap.umidade = sht31.readHumidity();
+    if (!isnan(snap.temperatura) && !isnan(snap.umidade)) {
+      rtc_sum_temp += snap.temperatura;
+      rtc_sum_hum += snap.umidade;
       rtc_count_temp_hum++;
-      shtReadOk = true;
+      snap.shtReadOk = true;
     } else {
       logPrintf("Leitura invalida do SHT31 (NaN).\n");
     }
   }
 
-  // 4) INA219: painel (0x40) e sistema (0x41)
-  bool inaPainelReadOk = false;
-  bool inaSistemaReadOk = false;
-  float vPainel = NAN, iPainel = NAN, pPainel = NAN;
-  float vSistema = NAN, iSistema = NAN, pSistema = NAN;
   if (s_inaPainelOk) {
-    vPainel = inaPainel.getBusVoltage_V();
-    iPainel = inaPainel.getCurrent_mA();
-    pPainel = inaPainel.getPower_mW();
-    if (iPainel < 0.0f) iPainel = 0.0f;
-    if (pPainel < 0.0f) pPainel = 0.0f;
-    if (!isnan(vPainel) && !isnan(iPainel) && !isnan(pPainel)) {
-      rtc_sum_vpainel += vPainel;
-      rtc_sum_ipainel += iPainel;
-      rtc_sum_ppainel += pPainel;
+    snap.vPainel = inaPainel.getBusVoltage_V();
+    snap.iPainel = inaPainel.getCurrent_mA();
+    snap.pPainel = inaPainel.getPower_mW();
+    if (snap.iPainel < 0.0f) snap.iPainel = 0.0f;
+    if (snap.pPainel < 0.0f) snap.pPainel = 0.0f;
+    if (!isnan(snap.vPainel) && !isnan(snap.iPainel) && !isnan(snap.pPainel)) {
+      rtc_sum_vpainel += snap.vPainel;
+      rtc_sum_ipainel += snap.iPainel;
+      rtc_sum_ppainel += snap.pPainel;
       rtc_count_painel++;
-      inaPainelReadOk = true;
+      snap.inaPainelReadOk = true;
     } else {
       logPrintf("Leitura invalida do INA219 painel (NaN).\n");
     }
   }
   if (s_inaSistemaOk) {
-    vSistema = inaSistema.getBusVoltage_V();
-    iSistema = inaSistema.getCurrent_mA();
-    pSistema = inaSistema.getPower_mW();
-    if (!isnan(vSistema) && !isnan(iSistema) && !isnan(pSistema)) {
-      rtc_sum_vsistema += vSistema;
-      rtc_sum_isistema += iSistema;
-      rtc_sum_psistema += pSistema;
+    snap.vSistema = inaSistema.getBusVoltage_V();
+    snap.iSistema = inaSistema.getCurrent_mA();
+    snap.pSistema = inaSistema.getPower_mW();
+    if (!isnan(snap.vSistema) && !isnan(snap.iSistema) && !isnan(snap.pSistema)) {
+      rtc_sum_vsistema += snap.vSistema;
+      rtc_sum_isistema += snap.iSistema;
+      rtc_sum_psistema += snap.pSistema;
       rtc_count_sistema++;
-      inaSistemaReadOk = true;
+      snap.inaSistemaReadOk = true;
     } else {
       logPrintf("Leitura invalida do INA219 sistema (NaN).\n");
     }
   }
 
+  return snap;
+}
+
+void runCycle() {
+  const SensorSnapshot snap = accumulateSensorSample();
+
   rtc_total_samples++;
 
   logPrintf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
                 rtc_total_samples, (int)SAMPLES_PER_API_UPLOAD,
-                bmeReadOk ? pSeaBme : NAN,
-                shtReadOk ? temperatura : NAN,
-                shtReadOk ? umidade : NAN,
-                inaPainelReadOk ? vPainel : NAN,
-                inaPainelReadOk ? iPainel : NAN,
-                inaPainelReadOk ? pPainel : NAN,
-                inaSistemaReadOk ? vSistema : NAN,
-                inaSistemaReadOk ? iSistema : NAN,
-                inaSistemaReadOk ? pSistema : NAN);
-  logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", soil1, soil2);
+                snap.bmeReadOk ? snap.pSeaBme : NAN,
+                snap.shtReadOk ? snap.temperatura : NAN,
+                snap.shtReadOk ? snap.umidade : NAN,
+                snap.inaPainelReadOk ? snap.vPainel : NAN,
+                snap.inaPainelReadOk ? snap.iPainel : NAN,
+                snap.inaPainelReadOk ? snap.pPainel : NAN,
+                snap.inaSistemaReadOk ? snap.vSistema : NAN,
+                snap.inaSistemaReadOk ? snap.iSistema : NAN,
+                snap.inaSistemaReadOk ? snap.pSistema : NAN);
+  logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", snap.soil1, snap.soil2);
 
   // Comandos manuais sao verificados em todo wake (apos leituras de ADC/sensores).
   processManualIrrigation();
@@ -775,11 +810,11 @@ void runCycle() {
   int irrigationSeconds2 = 0;
   IrrigationConfig irrigationCfg {};
   if (fetchIrrigationConfig(irrigationCfg)) {
-    const float soilDecision1 = !isnan(soil1)
-        ? soil1
+    const float soilDecision1 = !isnan(snap.soil1)
+        ? snap.soil1
         : (rtc_count_soil_1 > 0 ? (rtc_sum_soil_1 / rtc_count_soil_1) : NAN);
-    const float soilDecision2 = !isnan(soil2)
-        ? soil2
+    const float soilDecision2 = !isnan(snap.soil2)
+        ? snap.soil2
         : (rtc_count_soil_2 > 0 ? (rtc_sum_soil_2 / rtc_count_soil_2) : NAN);
     irrigationSeconds1 = maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1, rtc_irrigation_armed_1);
     irrigationSeconds2 = maybeIrrigateZone(RELAY_PIN_2, soilDecision2, irrigationCfg.zone2, rtc_irrigation_armed_2);
