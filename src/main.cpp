@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 #include <esp_sleep.h>
+#include <Preferences.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SHT31.h>
@@ -115,20 +116,60 @@ Adafruit_SHT31 sht31 = Adafruit_SHT31();
 Adafruit_INA219 inaPainel(INA219_PAINEL_ADDR);
 Adafruit_INA219 inaSistema(INA219_SISTEMA_ADDR);
 
-// Irrigacao bloqueia por dezenas de segundos (delay + HTTP). Desliga todos os WDTs
-// para evitar TG0WDT e interrupt-WDT no IDLE das duas CPUs durante WiFi/HTTP.
+// Irrigacao bloqueia por dezenas de segundos (delay). Desliga loop/core0 WDT apenas
+// durante o acionamento do rele; I/O de rede roda com watchdog ativo.
 struct PumpWdtGuard {
   PumpWdtGuard() {
     disableLoopWDT();
     disableCore0WDT();
-    disableCore1WDT();
   }
   ~PumpWdtGuard() {
-    enableCore1WDT();
     enableCore0WDT();
     enableLoopWDT();
   }
 };
+
+static Preferences s_manualPrefs;
+static const char* const kManualPrefsNamespace = "irr_manual";
+
+static bool initManualPrefs() { return s_manualPrefs.begin(kManualPrefsNamespace, false); }
+
+static int32_t loadPersistedLastManualId(int zone) {
+  const char* key = (zone == 1) ? "last_id_z1" : "last_id_z2";
+  return static_cast<int32_t>(s_manualPrefs.getUInt(key, 0));
+}
+
+static void persistLastManualId(int zone, int32_t id) {
+  const char* key = (zone == 1) ? "last_id_z1" : "last_id_z2";
+  s_manualPrefs.putUInt(key, static_cast<uint32_t>(id));
+  if (zone == 1) {
+    rtc_last_manual_id_1 = id;
+  } else {
+    rtc_last_manual_id_2 = id;
+  }
+}
+
+static void syncManualIdsFromNvsIfNeeded() {
+  const int32_t nvs1 = loadPersistedLastManualId(1);
+  const int32_t nvs2 = loadPersistedLastManualId(2);
+  if (nvs1 > 0) {
+    rtc_last_manual_id_1 = nvs1;
+  }
+  if (nvs2 > 0) {
+    rtc_last_manual_id_2 = nvs2;
+  }
+}
+
+static bool isManualCommandAlreadyFinished(int zone, int32_t cmdId) {
+  if (cmdId <= 0) {
+    return false;
+  }
+  const int32_t rtcLast = (zone == 1) ? rtc_last_manual_id_1 : rtc_last_manual_id_2;
+  if (cmdId == rtcLast) {
+    return true;
+  }
+  return cmdId == loadPersistedLastManualId(zone);
+}
 
 static void clearActiveManualPump() {
   rtc_active_manual_id = 0;
@@ -560,16 +601,13 @@ static bool ackManualCommand(int32_t id, int executedS) {
 }
 
 static void finishManualCommand(const ManualCommand& cmd, int priorElapsedS, int ranS) {
-  const int totalRan = priorElapsedS + ranS;
+  (void)priorElapsedS;
   if (cmd.zone == 1) {
     rtc_manual_irrig_s_1 += static_cast<uint16_t>(ranS);
   } else {
     rtc_manual_irrig_s_2 += static_cast<uint16_t>(ranS);
   }
-  int32_t& lastId = (cmd.zone == 1) ? rtc_last_manual_id_1 : rtc_last_manual_id_2;
-  lastId = cmd.id;
-  ensureWiFi();
-  ackManualCommand(cmd.id, totalRan);
+  // ack e persistencia ja ocorrem em runPump() antes do flush da fila.
 }
 
 // Verifica e executa comandos manuais em todo wake (liga WiFi se preciso).
@@ -596,6 +634,12 @@ static void processManualIrrigation() {
                                rtc_active_manual_elapsed_s);
       finishManualCommand(resumeCmd, rtc_active_manual_elapsed_s, ranS);
     } else {
+      logPrintf("Irrigacao manual: comando %ld (zona %d) ja esgotou duracao; confirmando ack.\n",
+                    (long)resumeCmd.id, resumeCmd.zone);
+      if (ensureWiFi()) {
+        ackManualCommand(resumeCmd.id, resumeCmd.durationS);
+      }
+      persistLastManualId(resumeCmd.zone, resumeCmd.id);
       clearActiveManualPump();
     }
     return;
@@ -614,10 +658,9 @@ static void processManualIrrigation() {
 
   for (int i = 0; i < n; i++) {
     const ManualCommand& cmd = cmds[i];
-    int32_t& lastId = (cmd.zone == 1) ? rtc_last_manual_id_1 : rtc_last_manual_id_2;
     const bool isRunning = strcmp(cmd.status, "running") == 0;
 
-    if (cmd.id == lastId) {
+    if (isManualCommandAlreadyFinished(cmd.zone, cmd.id)) {
       logPrintf("Irrigacao manual: comando %ld (zona %d) ja concluido; reenviando ack.\n",
                     (long)cmd.id, cmd.zone);
       ensureWiFi();
@@ -626,11 +669,29 @@ static void processManualIrrigation() {
     }
 
     if (isRunning) {
-      const int prior = (rtc_active_manual_id == cmd.id) ? rtc_active_manual_elapsed_s : 0;
-      int remaining = cmd.durationS - prior;
-      if (remaining <= 0) {
-        remaining = cmd.durationS;
+      const bool hasResumeState = (rtc_active_manual_id == cmd.id);
+      if (!hasResumeState) {
+        logPrintf(
+            "Irrigacao manual: comando %ld (zona %d) running sem retomada; tratando como concluido.\n",
+            (long)cmd.id, cmd.zone);
+        ensureWiFi();
+        ackManualCommand(cmd.id, cmd.durationS);
+        persistLastManualId(cmd.zone, cmd.id);
+        continue;
       }
+
+      const int prior = rtc_active_manual_elapsed_s;
+      const int remaining = cmd.durationS - prior;
+      if (remaining <= 0) {
+        logPrintf("Irrigacao manual: comando %ld (zona %d) ja esgotou duracao; confirmando ack.\n",
+                      (long)cmd.id, cmd.zone);
+        ensureWiFi();
+        ackManualCommand(cmd.id, cmd.durationS);
+        persistLastManualId(cmd.zone, cmd.id);
+        clearActiveManualPump();
+        continue;
+      }
+
       logPrintf("Irrigacao manual: comando %ld (zona %d) em andamento; retomando por %d s.\n",
                     (long)cmd.id, cmd.zone, remaining);
       const int relayPin = (cmd.zone == 1) ? RELAY_PIN_1 : RELAY_PIN_2;
@@ -672,46 +733,56 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
     rtc_active_manual_elapsed_s = static_cast<uint16_t>(priorElapsedS);
   }
 
-  PumpWdtGuard wdtGuard;
-  const int otherPin = (relayPin == RELAY_PIN_1) ? RELAY_PIN_2 : RELAY_PIN_1;
-  setRelayState(otherPin, false);
-  setRelayState(relayPin, true);
-
   const uint32_t intervalMs = static_cast<uint32_t>(PUMP_SAMPLE_INTERVAL_S) * 1000UL;
   const uint32_t totalRunMs = static_cast<uint32_t>(durationS) * 1000UL;
   uint32_t remainingMs = totalRunMs;
-  while (remainingMs > 0) {
-    const uint32_t stepMs = min(remainingMs, intervalMs);
-    uint32_t stepRemaining = stepMs;
-    while (stepRemaining > 0) {
-      const uint32_t chunk = min(stepRemaining, static_cast<uint32_t>(PUMP_DELAY_CHUNK_MS));
-      delay(chunk);
-      stepRemaining -= chunk;
-      remainingMs -= chunk;
-      if (trackManual) {
-        const uint32_t elapsedRunMs = totalRunMs - remainingMs;
-        rtc_active_manual_elapsed_s =
-            static_cast<uint16_t>(priorElapsedS + elapsedRunMs / 1000UL);
+  {
+    PumpWdtGuard wdtGuard;
+    const int otherPin = (relayPin == RELAY_PIN_1) ? RELAY_PIN_2 : RELAY_PIN_1;
+    setRelayState(otherPin, false);
+    setRelayState(relayPin, true);
+
+    while (remainingMs > 0) {
+      const uint32_t stepMs = min(remainingMs, intervalMs);
+      uint32_t stepRemaining = stepMs;
+      while (stepRemaining > 0) {
+        const uint32_t chunk = min(stepRemaining, static_cast<uint32_t>(PUMP_DELAY_CHUNK_MS));
+        delay(chunk);
+        stepRemaining -= chunk;
+        remainingMs -= chunk;
+        if (trackManual) {
+          const uint32_t elapsedRunMs = totalRunMs - remainingMs;
+          rtc_active_manual_elapsed_s =
+              static_cast<uint16_t>(priorElapsedS + elapsedRunMs / 1000UL);
+        }
       }
-    }
-    if (remainingMs > 0) {
-      const SensorSnapshot snap = accumulateSensorSample();
-      logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
-                    snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
-      // Enfileira sem HTTP bloqueante enquanto o rele esta ligado (evita panic no WiFi stack).
-      uploadSnapshotNow(snap, true);
+      if (remainingMs > 0) {
+        const SensorSnapshot snap = accumulateSensorSample();
+        logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
+                      snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
+        // Enfileira sem HTTP bloqueante enquanto o rele esta ligado (evita panic no WiFi stack).
+        uploadSnapshotNow(snap, true);
+      }
     }
   }
 
   setRelayState(relayPin, false);
   if (trackManual) {
-    const uint32_t elapsedRunMs = totalRunMs - remainingMs;
     rtc_active_manual_elapsed_s =
-        static_cast<uint16_t>(priorElapsedS + elapsedRunMs / 1000UL);
+        static_cast<uint16_t>(priorElapsedS + durationS);
   }
   const SensorSnapshot postSnap = accumulateSensorSample();
   logPrintf("Irrigacao: amostra pos-bomba (solo Z1:%.1f%% Z2:%.1f%%)\n", postSnap.soil1, postSnap.soil2);
   uploadSnapshotNow(postSnap, true);
+
+  if (trackManual) {
+    const int totalRan = priorElapsedS + durationS;
+    if (ensureWiFi()) {
+      ackManualCommand(manualCmdId, totalRan);
+    }
+    persistLastManualId(manualZone, manualCmdId);
+    clearActiveManualPump();
+  }
 
   if (s_littlefsOk && ensureWiFi()) {
     const int flushed = pendingQueueFlush(5, sendPayloadWithRetriesForQueue);
@@ -720,9 +791,6 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
     }
   }
 
-  if (trackManual) {
-    clearActiveManualPump();
-  }
   return durationS;
 }
 
@@ -1097,12 +1165,17 @@ void setup() {
     return;
   }
 
+  if (!initManualPrefs()) {
+    logPrintf("Aviso: NVS de irrigacao manual indisponivel.\n");
+  }
+
   if (rtc_magic != RTC_MAGIC) {
     resetRtcWindow();
     rtc_irrigation_armed_1 = 1;
     rtc_irrigation_armed_2 = 1;
     rtc_last_manual_id_1 = 0;
     rtc_last_manual_id_2 = 0;
+    syncManualIdsFromNvsIfNeeded();
     clearActiveManualPump();
   } else {
     if (rtc_irrigation_armed_1 > 1) rtc_irrigation_armed_1 = 1;
