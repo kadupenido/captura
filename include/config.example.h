@@ -71,8 +71,10 @@
 #define NTP_DAYLIGHT_OFFSET_SEC   0
 
 // --- Fila offline (LittleFS) ---
-// Maximo de POSTs por acordar ao drenar a fila (evita WiFi ligado demais).
-#define PENDING_FLUSH_MAX_PER_WAKE  10
+// Maximo de registros por lote ao drenar a fila (1 POST /dados/lote por acordar).
+#define PENDING_BATCH_MAX_ITEMS     20
+// Teto do corpo HTTP do lote (~20 x 768 B por registro).
+#define PENDING_BATCH_MAX_BYTES     16384
 // Teto de tamanho do arquivo NDJSON; ao estourar, remove linhas mais antigas.
 // Dimensionado para ~5 dias de backlog com DEEP_SLEEP_SECONDS=120 e
 // SAMPLES_PER_API_UPLOAD=5 (1 linha a cada 10 min => 720 linhas em 5 dias).

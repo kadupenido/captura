@@ -13,6 +13,12 @@
 #ifndef PENDING_MAX_LINES
 #define PENDING_MAX_LINES 800
 #endif
+#ifndef PENDING_BATCH_MAX_ITEMS
+#define PENDING_BATCH_MAX_ITEMS 20
+#endif
+#ifndef PENDING_BATCH_MAX_BYTES
+#define PENDING_BATCH_MAX_BYTES 16384
+#endif
 
 static const char* const kPendingPath = "/pending.ndjson";
 static const char* const kPendingTmp = "/pending.tmp";
@@ -259,4 +265,113 @@ int pendingQueueFlush(int maxItems, PendingSendFn send) {
   }
 
   return sent;
+}
+
+int pendingQueueFlushBatch(int maxItems, size_t maxBytes, PendingBatchSendFn send) {
+  struct stat st;
+  if (!send || maxItems <= 0 || maxBytes < 4 || stat(kPendingVfs, &st) != 0 || st.st_size == 0) {
+    return 0;
+  }
+
+  if (maxItems > PENDING_BATCH_MAX_ITEMS) {
+    maxItems = PENDING_BATCH_MAX_ITEMS;
+  }
+
+  File in = LittleFS.open(kPendingPath, "r");
+  if (!in || in.size() == 0) {
+    if (in) {
+      in.close();
+    }
+    return 0;
+  }
+
+  String batchLines[PENDING_BATCH_MAX_ITEMS];
+  int batchCount = 0;
+  size_t batchBytes = 2;  // "[]"
+  String holdBack;
+
+  while (in.available() && batchCount < maxItems) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      continue;
+    }
+
+    const size_t add = line.length() + (batchCount > 0 ? 1 : 0);
+    if (batchBytes + add > maxBytes) {
+      if (batchCount == 0) {
+        if (line.length() + 2 > maxBytes) {
+          in.close();
+          logPrintf("Fila: registro excede tamanho maximo do lote (%u bytes).\n", (unsigned)maxBytes);
+          return 0;
+        }
+        batchLines[batchCount++] = line;
+        batchBytes += add;
+      } else {
+        holdBack = line;
+      }
+      break;
+    }
+
+    batchLines[batchCount++] = line;
+    batchBytes += add;
+  }
+
+  if (batchCount == 0) {
+    in.close();
+    return 0;
+  }
+
+  String payload;
+  payload.reserve(batchBytes);
+  payload = "[";
+  for (int i = 0; i < batchCount; i++) {
+    if (i > 0) {
+      payload += ",";
+    }
+    payload += batchLines[i];
+  }
+  payload += "]";
+
+  if (send(payload.c_str(), payload.length()) != 201) {
+    in.close();
+    return 0;
+  }
+
+  File out = LittleFS.open(kPendingTmp, "w", true);
+  if (!out) {
+    in.close();
+    return 0;
+  }
+
+  int kept = 0;
+  if (holdBack.length() > 0) {
+    out.println(holdBack);
+    kept++;
+  }
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      continue;
+    }
+    out.println(line);
+    kept++;
+  }
+
+  in.close();
+  out.close();
+
+  LittleFS.remove(kPendingPath);
+  if (kept > 0) {
+    LittleFS.rename(kPendingTmp, kPendingPath);
+  } else {
+    LittleFS.remove(kPendingTmp);
+  }
+
+  if (s_lineCountValid) {
+    s_pendingLineCount = kept;
+  }
+
+  return batchCount;
 }

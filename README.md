@@ -99,7 +99,7 @@ Comandos manuais ignoram o flag `active` da zona. Irrigação automática respei
 ## Comportamento do ciclo
 
 1. **Acorda** do deep sleep (`DEEP_SLEEP_SECONDS`, padrão 60 s).
-2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível.
+2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível — até `PENDING_BATCH_MAX_ITEMS` registros por acordar num único `POST /dados/lote`.
 3. **Lê sensores** (solo, BME280, SHT31, INA219) sem Wi-Fi.
 4. **Verifica irrigação manual** — liga Wi-Fi, consulta `/irrigation/manual/pending`, executa bombas se necessário, confirma com ack.
    - **Durante a irrigação** (manual ou automática): a cada `PUMP_SAMPLE_INTERVAL_S` e na amostra pós-bomba, envia leitura instantânea via `POST /dados` (sem esperar a janela de upload). Falhas vão para a fila LittleFS.

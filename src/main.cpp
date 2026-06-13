@@ -22,8 +22,12 @@
 #define SAMPLES_PER_API_UPLOAD 10
 #endif
 
-#ifndef PENDING_FLUSH_MAX_PER_WAKE
-#define PENDING_FLUSH_MAX_PER_WAKE 10
+#ifndef PENDING_BATCH_MAX_ITEMS
+#define PENDING_BATCH_MAX_ITEMS 20
+#endif
+
+#ifndef PENDING_BATCH_MAX_BYTES
+#define PENDING_BATCH_MAX_BYTES 16384
 #endif
 
 #ifndef COLD_BOOT_USB_WAIT_MS
@@ -377,6 +381,23 @@ int sendData(const char* payload, size_t payloadLen) {
   return code;
 }
 
+int sendBatchData(const char* payload, size_t payloadLen) {
+  char url[192];
+  snprintf(url, sizeof(url), "%s/dados/lote", API_BASE_URL);
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " API_TOKEN);
+
+  int code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(payload)), payloadLen);
+  if (code != 201) {
+    logPrintf("Erro HTTP lote %d: %s\n", code, http.getString().c_str());
+  }
+  http.end();
+  return code;
+}
+
 int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
   int lastCode = -1;
   for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
@@ -393,7 +414,23 @@ int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
   return lastCode;
 }
 
-// Ponte para PendingSendFn (linhas lidas como String na fila).
+int sendBatchWithRetries(const char* payload, size_t payloadLen) {
+  int lastCode = -1;
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+    logPrintf("Envio lote tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
+    lastCode = sendBatchData(payload, payloadLen);
+    if (lastCode == 201) {
+      logPrintf("Lote enviado com sucesso.\n");
+      return 201;
+    }
+    if (attempt < HTTP_MAX_RETRIES) {
+      delay(2000);
+    }
+  }
+  return lastCode;
+}
+
+// Ponte para PendingSendFn (linhas lidas como String na fila; envio unitario legado).
 int sendPayloadWithRetriesForQueue(const String& payload) {
   return sendPayloadWithRetries(payload.c_str(), payload.length());
 }
@@ -785,9 +822,10 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
   }
 
   if (s_littlefsOk && ensureWiFi()) {
-    const int flushed = pendingQueueFlush(5, sendPayloadWithRetriesForQueue);
+    const int flushed = pendingQueueFlushBatch(
+        PENDING_BATCH_MAX_ITEMS, PENDING_BATCH_MAX_BYTES, sendBatchWithRetries);
     if (flushed > 0) {
-      logPrintf("Irrigacao: %d snapshot(s) enviado(s) da fila.\n", flushed);
+      logPrintf("Irrigacao: %d registro(s) enviado(s) da fila (lote).\n", flushed);
     }
   }
 
@@ -1192,16 +1230,17 @@ void setup() {
       logPrintf("Fila offline: itens pendentes; tentando enviar...\n");
     }
     if (ensureWiFi()) {
-      int n = pendingQueueFlush(PENDING_FLUSH_MAX_PER_WAKE, sendPayloadWithRetriesForQueue);
+      int n = pendingQueueFlushBatch(
+          PENDING_BATCH_MAX_ITEMS, PENDING_BATCH_MAX_BYTES, sendBatchWithRetries);
       int remaining = pendingQueueCount();
       if (remaining < 0) {
         remaining = pendingQueueHasPending() ? -1 : 0;
       }
       if (n > 0) {
         if (remaining >= 0) {
-          logPrintf("Fila: enviados %d; restam %d.\n", n, remaining);
+          logPrintf("Fila: lote enviado (%d registro(s)); restam %d.\n", n, remaining);
         } else {
-          logPrintf("Fila: enviados %d registro(s) pendente(s).\n", n);
+          logPrintf("Fila: lote enviado (%d registro(s)).\n", n);
         }
       } else if (remaining > 0) {
         logPrintf("Fila: nada enviado; restam %d.\n", remaining);
