@@ -20,7 +20,5 @@
 #define SOIL_ADC_PIN_2      2
 #define RELAY_PIN_1         35
 #define RELAY_PIN_2         36
-// 1 = rele ativo em nivel alto; 0 = ativo em nivel baixo.
-#define RELAY_ACTIVE_HIGH   1
 
 #endif

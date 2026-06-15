@@ -20,18 +20,6 @@
 #include "log.h"
 #include "pending_queue.h"
 
-#ifndef ADC_SAMPLES
-#define ADC_SAMPLES 16
-#endif
-
-#ifndef PUMP_DELAY_CHUNK_MS
-#define PUMP_DELAY_CHUNK_MS 500
-#endif
-
-#ifndef PAINEL_VOLTAGE_NOISE_FLOOR_V
-#define PAINEL_VOLTAGE_NOISE_FLOOR_V 1.0f
-#endif
-
 #define RTC_MAGIC 0x4D455449  // "METI" meteo dual
 
 // Reducao barometrica isotermica: P_nm = P_local * exp(g*h/(R*T_K)), T_K = temperatura medida.
@@ -39,34 +27,10 @@ static constexpr float kGravity = 9.80665f;
 static constexpr float kGasConstantDryAir = 287.05f;
 
 RTC_DATA_ATTR uint32_t rtc_magic;
-// BME280: somente pressao
-RTC_DATA_ATTR float rtc_sum_press;
-RTC_DATA_ATTR uint16_t rtc_count_press;
-// SHT31: temperatura, umidade (fonte exclusiva)
-RTC_DATA_ATTR float rtc_sum_temp;
-RTC_DATA_ATTR float rtc_sum_hum;
-RTC_DATA_ATTR uint16_t rtc_count_temp_hum;
-// INA219 painel
-RTC_DATA_ATTR float rtc_sum_vpainel;
-RTC_DATA_ATTR float rtc_sum_ipainel;
-RTC_DATA_ATTR float rtc_sum_ppainel;
-RTC_DATA_ATTR uint16_t rtc_count_painel;
-// INA219 sistema
-RTC_DATA_ATTR float rtc_sum_vsistema;
-RTC_DATA_ATTR float rtc_sum_isistema;
-RTC_DATA_ATTR float rtc_sum_psistema;
-RTC_DATA_ATTR uint16_t rtc_count_sistema;
-// Umidade do solo por zona
-RTC_DATA_ATTR float rtc_sum_soil_1;
-RTC_DATA_ATTR float rtc_sum_soil_2;
-RTC_DATA_ATTR uint16_t rtc_count_soil_1;
-RTC_DATA_ATTR uint16_t rtc_count_soil_2;
-// Total de wakes acumulados na janela
-RTC_DATA_ATTR uint8_t rtc_total_samples;
 // Histerese da irrigacao por zona (persistente entre wakes).
 RTC_DATA_ATTR uint8_t rtc_irrigation_armed_1;
 RTC_DATA_ATTR uint8_t rtc_irrigation_armed_2;
-// Irrigacao manual: segundos acumulados na janela (entram em tempo_irrigacao_s_N).
+// Irrigacao manual: segundos acumulados no ciclo (entram em tempo_irrigacao_s_N).
 RTC_DATA_ATTR uint16_t rtc_manual_irrig_s_1;
 RTC_DATA_ATTR uint16_t rtc_manual_irrig_s_2;
 // Ultimo comando manual executado por zona (evita re-execucao se o ack falhar).
@@ -246,17 +210,17 @@ static float clampPct(float v) {
 }
 
 static void setRelayState(int pin, bool on) {
-#if RELAY_ACTIVE_HIGH
-  digitalWrite(pin, on ? HIGH : LOW);
-#else
-  digitalWrite(pin, on ? LOW : HIGH);
-#endif
+  if (deviceConfig().relay_active_high) {
+    digitalWrite(pin, on ? HIGH : LOW);
+  } else {
+    digitalWrite(pin, on ? LOW : HIGH);
+  }
 }
 
 static float readAdcMilliVoltsAvg(int pin) {
   uint32_t accumMv = 0;
   int valid = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
+  for (int i = 0; i < deviceConfig().adc_samples; i++) {
     uint32_t mv = analogReadMilliVolts(pin);
     accumMv += mv;
     valid++;
@@ -277,28 +241,10 @@ static float readSoilPercent(int pin, float dryMv, float wetMv) {
   return clampPct(pct);
 }
 
-void resetRtcWindow() {
+void resetRtcState() {
   rtc_magic = RTC_MAGIC;
-  rtc_sum_press = 0.0F;
-  rtc_count_press = 0;
-  rtc_sum_temp = 0.0F;
-  rtc_sum_hum = 0.0F;
-  rtc_count_temp_hum = 0;
-  rtc_sum_vpainel = 0.0F;
-  rtc_sum_ipainel = 0.0F;
-  rtc_sum_ppainel = 0.0F;
-  rtc_count_painel = 0;
-  rtc_sum_vsistema = 0.0F;
-  rtc_sum_isistema = 0.0F;
-  rtc_sum_psistema = 0.0F;
-  rtc_count_sistema = 0;
-  rtc_sum_soil_1 = 0.0F;
-  rtc_sum_soil_2 = 0.0F;
-  rtc_count_soil_1 = 0;
-  rtc_count_soil_2 = 0;
   rtc_manual_irrig_s_1 = 0;
   rtc_manual_irrig_s_2 = 0;
-  rtc_total_samples = 0;
 }
 
 void enterDeepSleep() {
@@ -450,7 +396,7 @@ int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
       return 201;
     }
     if (attempt < deviceConfig().http_max_retries) {
-      delay(2000);
+      delay(deviceConfig().http_retry_delay_ms);
     }
   }
   return lastCode;
@@ -466,7 +412,7 @@ int sendBatchWithRetries(const char* payload, size_t payloadLen) {
       return 201;
     }
     if (attempt < deviceConfig().http_max_retries) {
-      delay(2000);
+      delay(deviceConfig().http_retry_delay_ms);
     }
   }
   return lastCode;
@@ -550,7 +496,10 @@ struct SensorSnapshot {
   float pSistema = NAN;
 };
 
-static SensorSnapshot accumulateSensorSample(bool includeInWindow = true);
+static SensorSnapshot captureAmbientSnapshot();
+static void capturePowerSnapshot(SensorSnapshot& snap);
+static SensorSnapshot captureInstantSnapshot();
+static void runCaptureCycle();
 static bool uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly = false, int irrigS1 = -1,
                               int irrigS2 = -1);
 static int runPump(int relayPin, int durationS, int32_t manualCmdId = 0, int manualZone = 0,
@@ -644,7 +593,7 @@ static bool startManualCommand(int32_t id) {
     logPrintf("Irrigacao manual: start tentativa %d/%d falhou (%d).\n", attempt,
               deviceConfig().http_max_retries, code);
     if (attempt < deviceConfig().http_max_retries) {
-      delay(2000);
+      delay(deviceConfig().http_retry_delay_ms);
     }
   }
   return false;
@@ -678,7 +627,7 @@ static bool ackManualCommand(int32_t id, int executedS) {
     logPrintf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt,
               deviceConfig().http_max_retries, code);
     if (attempt < deviceConfig().http_max_retries) {
-      delay(2000);
+      delay(deviceConfig().http_retry_delay_ms);
     }
   }
   return false;
@@ -849,7 +798,8 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
       const uint32_t stepMs = min(remainingMs, intervalMs);
       uint32_t stepRemaining = stepMs;
       while (stepRemaining > 0) {
-        const uint32_t chunk = min(stepRemaining, static_cast<uint32_t>(PUMP_DELAY_CHUNK_MS));
+        const uint32_t chunk =
+            min(stepRemaining, static_cast<uint32_t>(deviceConfig().pump_delay_chunk_ms));
         delay(chunk);
         stepRemaining -= chunk;
         remainingMs -= chunk;
@@ -863,7 +813,7 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
         }
       }
       if (remainingMs > 0) {
-        const SensorSnapshot snap = accumulateSensorSample(false);
+        const SensorSnapshot snap = captureInstantSnapshot();
         logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
                       snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
         // Enfileira sem HTTP bloqueante enquanto o rele esta ligado (evita panic no WiFi stack).
@@ -878,7 +828,7 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
         static_cast<uint16_t>(priorElapsedS + durationS);
     persistActiveManualState();
   }
-  const SensorSnapshot postSnap = accumulateSensorSample(false);
+  const SensorSnapshot postSnap = captureInstantSnapshot();
   logPrintf("Irrigacao: amostra pos-bomba (solo Z1:%.1f%% Z2:%.1f%%)\n", postSnap.soil1, postSnap.soil2);
   uploadSnapshotNow(postSnap, true);
 
@@ -929,33 +879,18 @@ static float roundTo2(float v) {
   return roundf(v * 100.0f) / 100.0f;
 }
 
-static SensorSnapshot accumulateSensorSample(bool includeInWindow) {
+static SensorSnapshot captureInstantSnapshot() {
   SensorSnapshot snap;
-
   const DeviceConfig& cfg = deviceConfig();
+
   snap.soil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
   snap.soil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
-  if (includeInWindow && !isnan(snap.soil1)) {
-    rtc_sum_soil_1 += snap.soil1;
-    rtc_count_soil_1++;
-  }
-  if (includeInWindow && !isnan(snap.soil2)) {
-    rtc_sum_soil_2 += snap.soil2;
-    rtc_count_soil_2++;
-  }
 
   if (s_shtOk) {
     snap.temperatura = sht31.readTemperature();
     snap.umidade = sht31.readHumidity();
     if (!isnan(snap.temperatura) && !isnan(snap.umidade)) {
-      if (includeInWindow) {
-        rtc_sum_temp += snap.temperatura;
-        rtc_sum_hum += snap.umidade;
-        rtc_count_temp_hum++;
-      }
       snap.shtReadOk = true;
-    } else {
-      logPrintf("Leitura invalida do SHT31 (NaN).\n");
     }
   }
 
@@ -963,19 +898,11 @@ static SensorSnapshot accumulateSensorSample(bool includeInWindow) {
     bme.takeForcedMeasurement();
     const float pLocalBme = bme.readPressure() / 100.0F;
     if (!isnan(pLocalBme)) {
-      const float tempRefC = snap.shtReadOk
-          ? snap.temperatura
-          : ((rtc_count_temp_hum > 0) ? (rtc_sum_temp / rtc_count_temp_hum) : 25.0f);
+      const float tempRefC = snap.shtReadOk ? snap.temperatura : 25.0f;
       const float tKelvin = tempRefC + 273.15f;
       snap.pSeaBme = pLocalBme * expf((kGravity * static_cast<float>(deviceConfig().altitude_local)) /
                                       (kGasConstantDryAir * tKelvin));
-      if (includeInWindow) {
-        rtc_sum_press += snap.pSeaBme;
-        rtc_count_press++;
-      }
       snap.bmeReadOk = true;
-    } else {
-      logPrintf("Leitura invalida do BME280 (NaN).\n");
     }
   }
 
@@ -983,19 +910,13 @@ static SensorSnapshot accumulateSensorSample(bool includeInWindow) {
     snap.vPainel = inaPainel.getBusVoltage_V();
     snap.iPainel = inaPainel.getCurrent_mA();
     snap.pPainel = inaPainel.getPower_mW();
-    if (snap.vPainel < PAINEL_VOLTAGE_NOISE_FLOOR_V) snap.vPainel = 0.0f;
+    if (cfg.panel_voltage_noise_floor_v > 0.0f && snap.vPainel < cfg.panel_voltage_noise_floor_v) {
+      snap.vPainel = 0.0f;
+    }
     if (snap.iPainel < 0.0f) snap.iPainel = 0.0f;
     if (snap.pPainel < 0.0f) snap.pPainel = 0.0f;
     if (!isnan(snap.vPainel) && !isnan(snap.iPainel) && !isnan(snap.pPainel)) {
-      if (includeInWindow) {
-        rtc_sum_vpainel += snap.vPainel;
-        rtc_sum_ipainel += snap.iPainel;
-        rtc_sum_ppainel += snap.pPainel;
-        rtc_count_painel++;
-      }
       snap.inaPainelReadOk = true;
-    } else {
-      logPrintf("Leitura invalida do INA219 painel (NaN).\n");
     }
   }
   if (s_inaSistemaOk) {
@@ -1005,19 +926,154 @@ static SensorSnapshot accumulateSensorSample(bool includeInWindow) {
     if (snap.iSistema < 0.0f) snap.iSistema = 0.0f;
     if (snap.pSistema < 0.0f) snap.pSistema = 0.0f;
     if (!isnan(snap.vSistema) && !isnan(snap.iSistema) && !isnan(snap.pSistema)) {
-      if (includeInWindow) {
-        rtc_sum_vsistema += snap.vSistema;
-        rtc_sum_isistema += snap.iSistema;
-        rtc_sum_psistema += snap.pSistema;
-        rtc_count_sistema++;
-      }
       snap.inaSistemaReadOk = true;
-    } else {
-      logPrintf("Leitura invalida do INA219 sistema (NaN).\n");
     }
   }
 
   return snap;
+}
+
+static SensorSnapshot captureAmbientSnapshot() {
+  SensorSnapshot snap;
+  const DeviceConfig& cfg = deviceConfig();
+
+  float sumSoil1 = 0.0F;
+  float sumSoil2 = 0.0F;
+  uint16_t countSoil1 = 0;
+  uint16_t countSoil2 = 0;
+  float sumTemp = 0.0F;
+  float sumHum = 0.0F;
+  uint16_t countTempHum = 0;
+  float sumPress = 0.0F;
+  uint16_t countPress = 0;
+
+  for (int round = 0; round < cfg.sensor_average_rounds; round++) {
+    const float soil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
+    const float soil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+    if (!isnan(soil1)) {
+      sumSoil1 += soil1;
+      countSoil1++;
+    }
+    if (!isnan(soil2)) {
+      sumSoil2 += soil2;
+      countSoil2++;
+    }
+
+    if (s_shtOk) {
+      const float temperatura = sht31.readTemperature();
+      const float umidade = sht31.readHumidity();
+      if (!isnan(temperatura) && !isnan(umidade)) {
+        sumTemp += temperatura;
+        sumHum += umidade;
+        countTempHum++;
+      } else {
+        logPrintf("Leitura invalida do SHT31 (NaN).\n");
+      }
+    }
+
+    if (s_bmeOk) {
+      bme.takeForcedMeasurement();
+      const float pLocalBme = bme.readPressure() / 100.0F;
+      if (!isnan(pLocalBme)) {
+        const float tempRefC = countTempHum > 0 ? (sumTemp / countTempHum) : 25.0f;
+        const float tKelvin = tempRefC + 273.15f;
+        const float pSea = pLocalBme * expf((kGravity * static_cast<float>(deviceConfig().altitude_local)) /
+                                            (kGasConstantDryAir * tKelvin));
+        sumPress += pSea;
+        countPress++;
+      } else {
+        logPrintf("Leitura invalida do BME280 (NaN).\n");
+      }
+    }
+  }
+
+  if (countSoil1 > 0) {
+    snap.soil1 = sumSoil1 / static_cast<float>(countSoil1);
+  }
+  if (countSoil2 > 0) {
+    snap.soil2 = sumSoil2 / static_cast<float>(countSoil2);
+  }
+  if (countTempHum > 0) {
+    snap.temperatura = sumTemp / static_cast<float>(countTempHum);
+    snap.umidade = sumHum / static_cast<float>(countTempHum);
+    snap.shtReadOk = true;
+  }
+  if (countPress > 0) {
+    snap.pSeaBme = sumPress / static_cast<float>(countPress);
+    snap.bmeReadOk = true;
+  }
+
+  return snap;
+}
+
+static void capturePowerSnapshot(SensorSnapshot& snap) {
+  if (!s_inaPainelOk && !s_inaSistemaOk) {
+    return;
+  }
+
+  const DeviceConfig& cfg = deviceConfig();
+  const float panelNoiseFloor = cfg.panel_voltage_noise_floor_v;
+
+  float sumVpainel = 0.0F;
+  float sumIpainel = 0.0F;
+  float sumPpainel = 0.0F;
+  uint16_t countPainel = 0;
+  float sumVsistema = 0.0F;
+  float sumIsistema = 0.0F;
+  float sumPsistema = 0.0F;
+  uint16_t countSistema = 0;
+
+  for (int round = 0; round < cfg.ina_average_rounds; round++) {
+    if (s_inaPainelOk) {
+      float vPainel = inaPainel.getBusVoltage_V();
+      float iPainel = inaPainel.getCurrent_mA();
+      float pPainel = inaPainel.getPower_mW();
+      if (panelNoiseFloor > 0.0f && vPainel < panelNoiseFloor) vPainel = 0.0f;
+      if (iPainel < 0.0f) iPainel = 0.0f;
+      if (pPainel < 0.0f) pPainel = 0.0f;
+      if (!isnan(vPainel) && !isnan(iPainel) && !isnan(pPainel)) {
+        sumVpainel += vPainel;
+        sumIpainel += iPainel;
+        sumPpainel += pPainel;
+        countPainel++;
+      } else {
+        logPrintf("Leitura invalida do INA219 painel (NaN).\n");
+      }
+    }
+
+    if (s_inaSistemaOk) {
+      float vSistema = inaSistema.getBusVoltage_V();
+      float iSistema = inaSistema.getCurrent_mA();
+      float pSistema = inaSistema.getPower_mW();
+      if (iSistema < 0.0f) iSistema = 0.0f;
+      if (pSistema < 0.0f) pSistema = 0.0f;
+      if (!isnan(vSistema) && !isnan(iSistema) && !isnan(pSistema)) {
+        sumVsistema += vSistema;
+        sumIsistema += iSistema;
+        sumPsistema += pSistema;
+        countSistema++;
+      } else {
+        logPrintf("Leitura invalida do INA219 sistema (NaN).\n");
+      }
+    }
+
+    if (round + 1 < cfg.ina_average_rounds) {
+      delay(cfg.ina_sample_delay_ms);
+    }
+  }
+
+  if (countPainel > 0) {
+    snap.vPainel = sumVpainel / static_cast<float>(countPainel);
+    snap.iPainel = sumIpainel / static_cast<float>(countPainel);
+    snap.pPainel = sumPpainel / static_cast<float>(countPainel);
+    snap.inaPainelReadOk = true;
+  }
+  if (countSistema > 0) {
+    snap.vSistema = sumVsistema / static_cast<float>(countSistema);
+    snap.iSistema = sumIsistema / static_cast<float>(countSistema);
+    snap.pSistema = sumPsistema / static_cast<float>(countSistema);
+    snap.inaSistemaReadOk = true;
+  }
 }
 
 static bool appendSnapshotToJson(const SensorSnapshot& snap, JsonDocument& doc) {
@@ -1118,9 +1174,7 @@ static void flushPendingQueueWithFallback(const char* context) {
   }
 }
 
-void runActiveCycle() {
-  const SensorSnapshot snap = accumulateSensorSample(false);
-
+static void logSensorSnapshot(const SensorSnapshot& snap) {
   logPrintf("P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
                 snap.bmeReadOk ? snap.pSeaBme : NAN,
                 snap.shtReadOk ? snap.temperatura : NAN,
@@ -1132,8 +1186,20 @@ void runActiveCycle() {
                 snap.inaSistemaReadOk ? snap.iSistema : NAN,
                 snap.inaSistemaReadOk ? snap.pSistema : NAN);
   logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", snap.soil1, snap.soil2);
+}
+
+static void runCaptureCycle() {
+  SensorSnapshot snap = captureAmbientSnapshot();
 
   processManualIrrigation();
+
+  if (ensureWiFi()) {
+    capturePowerSnapshot(snap);
+  } else {
+    logPrintf("Power: WiFi indisponivel; INA219 omitido neste wake.\n");
+  }
+
+  logSensorSnapshot(snap);
 
   int irrigationSeconds1 = rtc_manual_irrig_s_1;
   int irrigationSeconds2 = rtc_manual_irrig_s_2;
@@ -1164,159 +1230,6 @@ void runActiveCycle() {
   }
 
   wifiOffIfConnected();
-}
-
-void runCycle() {
-  const SensorSnapshot snap = accumulateSensorSample();
-
-  rtc_total_samples++;
-
-  logPrintf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
-                rtc_total_samples, deviceConfig().samples_per_api_upload,
-                snap.bmeReadOk ? snap.pSeaBme : NAN,
-                snap.shtReadOk ? snap.temperatura : NAN,
-                snap.shtReadOk ? snap.umidade : NAN,
-                snap.inaPainelReadOk ? snap.vPainel : NAN,
-                snap.inaPainelReadOk ? snap.iPainel : NAN,
-                snap.inaPainelReadOk ? snap.pPainel : NAN,
-                snap.inaSistemaReadOk ? snap.vSistema : NAN,
-                snap.inaSistemaReadOk ? snap.iSistema : NAN,
-                snap.inaSistemaReadOk ? snap.pSistema : NAN);
-  logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", snap.soil1, snap.soil2);
-
-  // Comandos manuais sao verificados em todo wake (apos leituras de ADC/sensores).
-  processManualIrrigation();
-
-  if (rtc_total_samples < deviceConfig().samples_per_api_upload) {
-    wifiOffIfConnected();
-    return;
-  }
-
-  // 4) Janela completa: monta JSON apenas com campos cujo contador > 0.
-  JsonDocument doc;
-
-  if (rtc_count_temp_hum > 0) {
-    doc["temperatura"] = roundTo2(rtc_sum_temp / rtc_count_temp_hum);
-    doc["umidade"] = roundTo2(rtc_sum_hum / rtc_count_temp_hum);
-  }
-  if (rtc_count_press > 0) {
-    doc["pressao"] = roundTo2(rtc_sum_press / rtc_count_press);
-  }
-  if (rtc_count_painel > 0) {
-    doc["tensao_painel"] = roundTo2(rtc_sum_vpainel / rtc_count_painel);
-    doc["corrente_painel"] = roundTo2(rtc_sum_ipainel / rtc_count_painel);
-    doc["potencia_painel"] = roundTo2(rtc_sum_ppainel / rtc_count_painel);
-  }
-  if (rtc_count_sistema > 0) {
-    doc["tensao_sistema"] = roundTo2(rtc_sum_vsistema / rtc_count_sistema);
-    doc["corrente_sistema"] = roundTo2(rtc_sum_isistema / rtc_count_sistema);
-    doc["potencia_sistema"] = roundTo2(rtc_sum_psistema / rtc_count_sistema);
-  }
-  if (rtc_count_soil_1 > 0) {
-    doc["umidade_solo_1"] = roundTo2(rtc_sum_soil_1 / rtc_count_soil_1);
-  }
-  if (rtc_count_soil_2 > 0) {
-    doc["umidade_solo_2"] = roundTo2(rtc_sum_soil_2 / rtc_count_soil_2);
-  }
-
-  if (doc.size() == 0) {
-    logPrintf("Janela sem nenhuma medicao valida; descartando.\n");
-    wifiOffIfConnected();
-    resetRtcWindow();
-    return;
-  }
-
-  logPrintf("Janela completa (TH=%d Press=%d Painel=%d Sistema=%d amostras validas em %d wakes).\n",
-                rtc_count_temp_hum, rtc_count_press, rtc_count_painel, rtc_count_sistema, rtc_total_samples);
-
-  const bool wifiUp = ensureWiFi();
-
-  if (!wifiUp) {
-    logPrintf("Falha ao conectar WiFi; gravando na fila local.\n");
-    doc["tempo_irrigacao_s_1"] = rtc_manual_irrig_s_1;
-    doc["tempo_irrigacao_s_2"] = rtc_manual_irrig_s_2;
-    appendCreatedAtUtcIfSynced(doc);
-    char payloadOffline[768];
-    size_t nOffline = serializeJson(doc, payloadOffline, sizeof(payloadOffline));
-    if (nOffline == 0 || nOffline >= sizeof(payloadOffline)) {
-      logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
-      wifiOffIfConnected();
-      return;
-    }
-    bool persisted = false;
-    if (s_littlefsOk) {
-      persisted = pendingQueueAppend(payloadOffline);
-      if (!persisted) {
-        logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
-      }
-    } else {
-      logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
-    }
-    wifiOffIfConnected();
-    if (persisted) {
-      resetRtcWindow();
-    } else {
-      logPrintf("Janela mantida para retentativa no proximo wake.\n");
-    }
-    return;
-  }
-  logPrintf("WiFi conectado.\n");
-
-  int irrigationSeconds1 = 0;
-  int irrigationSeconds2 = 0;
-  IrrigationConfig irrigationCfg {};
-  if (fetchIrrigationConfig(irrigationCfg)) {
-    const DeviceConfig& cfg = deviceConfig();
-    const float freshSoil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
-    const float freshSoil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
-    const float soilDecision1 = !isnan(freshSoil1)
-        ? freshSoil1
-        : (rtc_count_soil_1 > 0 ? (rtc_sum_soil_1 / rtc_count_soil_1) : NAN);
-    const float soilDecision2 = !isnan(freshSoil2)
-        ? freshSoil2
-        : (rtc_count_soil_2 > 0 ? (rtc_sum_soil_2 / rtc_count_soil_2) : NAN);
-    irrigationSeconds1 = maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1, rtc_irrigation_armed_1);
-    irrigationSeconds2 = maybeIrrigateZone(RELAY_PIN_2, soilDecision2, irrigationCfg.zone2, rtc_irrigation_armed_2);
-  } else {
-    logPrintf("Irrigacao: mantendo bombas desligadas por falta de configuracao.\n");
-  }
-  setRelayState(RELAY_PIN_1, false);
-  setRelayState(RELAY_PIN_2, false);
-
-  doc["tempo_irrigacao_s_1"] = irrigationSeconds1 + rtc_manual_irrig_s_1;
-  doc["tempo_irrigacao_s_2"] = irrigationSeconds2 + rtc_manual_irrig_s_2;
-  appendCreatedAtUtcIfSynced(doc);
-
-  char payload[768];
-  size_t n = serializeJson(doc, payload, sizeof(payload));
-  if (n == 0 || n >= sizeof(payload)) {
-    logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
-    wifiOffIfConnected();
-    logPrintf("Janela mantida para retentativa no proximo wake.\n");
-    return;
-  }
-
-  bool persisted = false;
-  if (sendPayloadWithRetries(payload, n) == 201) {
-    persisted = true;
-  } else {
-    logPrintf("Falha ao enviar dados apos todas as tentativas; gravando na fila local.\n");
-    if (s_littlefsOk) {
-      persisted = pendingQueueAppend(payload);
-      if (!persisted) {
-        logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
-      }
-    } else {
-      logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
-    }
-  }
-
-  wifiOffIfConnected();
-  if (persisted) {
-    resetRtcWindow();
-  } else {
-    logPrintf("Janela mantida para retentativa no proximo wake.\n");
-  }
 }
 
 void setup() {
@@ -1392,7 +1305,7 @@ void setup() {
   }
 
   if (rtc_magic != RTC_MAGIC) {
-    resetRtcWindow();
+    resetRtcState();
     rtc_irrigation_armed_1 = 1;
     rtc_irrigation_armed_2 = 1;
     rtc_last_manual_id_1 = 0;
@@ -1438,11 +1351,11 @@ void setup() {
 
   if (deviceConfig().deep_sleep_enabled) {
     logPrintf("Modo: deep sleep (%d s entre wakes)\n", deviceConfig().deep_sleep_seconds);
-    runCycle();
+    runCaptureCycle();
     enterDeepSleep();
   } else {
     logPrintf("Modo: ativo (captura a cada %d s)\n", deviceConfig().capture_interval_seconds);
-    runActiveCycle();
+    runCaptureCycle();
   }
 }
 
@@ -1457,5 +1370,5 @@ void loop() {
     }
     wifiOffIfConnected();
   }
-  runActiveCycle();
+  runCaptureCycle();
 }

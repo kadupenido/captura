@@ -1,6 +1,6 @@
 # Firmware Monitor Ambiental (Captura)
 
-Firmware embarcado para **ESP32-S3 DevKitC-1** que coleta dados ambientais, monitora energia (INA219), mede umidade do solo e controla duas zonas de irrigação. Opera em modo deep sleep (médias agregadas) ou modo sempre ativo (envio imediato a cada captura). Calibração, temporização, NTP e fila offline são configuráveis no painel web (`GET/PUT /device/config`).
+Firmware embarcado para **ESP32-S3 DevKitC-1** que coleta dados ambientais, monitora energia (INA219), mede umidade do solo e controla duas zonas de irrigação. Opera em modo deep sleep ou modo sempre ativo; em ambos envia **uma medição por ciclo** à API. Calibração, temporização, amostragem, NTP, fila offline e polaridade do relé são configuráveis no painel web (`GET/PUT /device/config`).
 
 Diagrama de pinos: [`esp32s3_pinout.svg`](esp32s3_pinout.svg).
 
@@ -17,11 +17,11 @@ Diagrama de pinos: [`esp32s3_pinout.svg`](esp32s3_pinout.svg).
 | Relé bomba 1 | Irrigação zona 1 | GPIO 35 |
 | Relé bomba 2 | Irrigação zona 2 | GPIO 36 |
 
-> **ADC e Wi-Fi:** leituras de solo e sensores I2C ocorrem no início de cada ciclo, **antes** de ligar o Wi-Fi. Durante irrigação manual com Wi-Fi ativo, o firmware continua amostrando solo e INA a cada intervalo configurável no painel.
+> **ADC e Wi-Fi:** leituras de solo ocorrem **antes** de ligar o Wi-Fi. INA219 (painel e sistema) é lido **com Wi-Fi ativo**, para que `corrente_sistema`/`potencia_sistema` incluam o consumo do rádio. Durante irrigação manual com Wi-Fi ativo, o firmware continua amostrando a cada intervalo configurável no painel.
 
 > **Bombas:** as duas nunca ficam energizadas ao mesmo tempo — `runPump()` desliga o outro relé antes de acionar.
 
-Pinos e endereços I2C ficam em `include/hardware_defaults.h` (fixos no firmware). Wi-Fi e API em `include/config.h`.
+Pinos e endereços I2C ficam em `include/hardware_defaults.h`. Wi-Fi e API em `include/config.h`.
 
 ## Requisitos
 
@@ -41,7 +41,24 @@ Edite `include/config.h` (somente rede e API):
 | `API_BASE_URL` | URL base da API (ex.: `https://tempo.exemplo.com/api`) |
 | `API_TOKEN` | Deve coincidir com `API_TOKEN` da API |
 
-Demais parâmetros (calibração solo, temporização, NTP, fila offline) são geridos no painel web em **Dispositivo → Configurações** e sincronizados via `GET /device/config`. Pinos de hardware: edite `include/hardware_defaults.h` se necessário.
+Demais parâmetros operacionais são geridos no painel web em **Dispositivo → Configurações** e sincronizados via `GET /device/config`:
+
+| Campo | Descrição |
+|-------|-----------|
+| `soil*_dry_mv` / `soil*_wet_mv` | Calibração ADC do solo por zona |
+| `altitude_local` | Altitude para correção barométrica |
+| `manual_irrigation_max_s` | Teto de duração da irrigação manual |
+| `pump_sample_interval_s` / `pump_delay_chunk_ms` | Amostragem durante irrigação |
+| `deep_sleep_enabled` / `deep_sleep_seconds` / `capture_interval_seconds` | Modo e intervalos de ciclo |
+| `http_*` / `wifi_timeout_ms` / `cold_boot_usb_wait_ms` | Timeouts de rede |
+| `ntp_*` | Servidores e offsets NTP |
+| `pending_*` | Limites da fila offline (LittleFS) |
+| `panel_voltage_noise_floor_v` | Limiar de ruído do painel solar (V); `0` desativa |
+| `sensor_average_rounds` / `adc_samples` | Média ambiental e amostras ADC do solo |
+| `ina_average_rounds` / `ina_sample_delay_ms` | Média INA219 por ciclo |
+| `relay_active_high` | Relé ativo em nível alto (`true`) ou baixo (`false`) |
+
+Pinos de hardware: edite `include/hardware_defaults.h` se necessário.
 
 Opcional: `WIFI_STATIC_IP`, `WIFI_GATEWAY`, `WIFI_SUBNET` para IP fixo.
 
@@ -59,7 +76,7 @@ pio device monitor -b 115200
 
 Header: `Authorization: Bearer {API_TOKEN}`.
 
-Campos opcionais (graceful degradation — sensores com falha na janela são omitidos):
+Campos opcionais (graceful degradation — sensores com falha no ciclo são omitidos):
 
 ```json
 {
@@ -85,44 +102,36 @@ Campos opcionais (graceful degradation — sensores com falha na janela são omi
 
 | Endpoint | Quando |
 |----------|--------|
-| `GET /irrigation/manual/pending` | Todo acordar (após leituras de sensores) |
+| `GET /irrigation/manual/pending` | Todo ciclo (após leituras ambientais) |
 | `POST /irrigation/manual/:id/start` | Antes de ligar a bomba |
 | `POST /irrigation/manual/:id/ack` | Após execução |
-| `GET /irrigation/config` | Modo deep sleep: no fim da janela de upload; modo ativo: a cada captura |
+| `GET /irrigation/config` | A cada captura (antes da irrigação automática) |
 
 Comandos manuais ignoram o flag `active` da zona. Irrigação automática respeita limiar, histerese e `active` da config na API.
 
 ## Comportamento do ciclo
 
-O firmware opera em um de dois modos, definidos por `DEEP_SLEEP_ENABLED` em `config.h`:
+O firmware opera em um de dois modos, definidos por `deep_sleep_enabled` no painel web:
 
-### Modo deep sleep (`DEEP_SLEEP_ENABLED=1`, padrão)
+### Modo deep sleep (`deep_sleep_enabled=true`, padrão)
 
 Indicado para operação em campo com bateria/painel solar — economiza energia dormindo entre ciclos.
 
-1. **Acorda** do deep sleep (`DEEP_SLEEP_SECONDS`, padrão 60 s).
-2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível — até `PENDING_BATCH_MAX_ITEMS` registros por acordar num único `POST /dados/lote`.
-3. **Lê sensores** (solo, BME280, SHT31, INA219) sem Wi-Fi.
+1. **Acorda** do deep sleep (`deep_sleep_seconds`, padrão 60 s).
+2. **Drena fila offline** (LittleFS NDJSON) se houver pendências e Wi-Fi disponível.
+3. **Lê sensores ambientais** (solo, BME280, SHT31) sem Wi-Fi — média de `sensor_average_rounds` rodadas por wake (solo usa `adc_samples` amostras ADC por rodada).
 4. **Verifica irrigação manual** — liga Wi-Fi, consulta `/irrigation/manual/pending`, executa bombas se necessário, confirma com ack.
-   - **Durante a irrigação** (manual ou automática): a cada `PUMP_SAMPLE_INTERVAL_S` e na amostra pós-bomba, envia leitura instantânea via `POST /dados` (sem esperar a janela de upload). Falhas vão para a fila LittleFS.
-5. Se ainda não completou a janela (`SAMPLES_PER_API_UPLOAD`), **volta a dormir**.
-6. Na janela completa:
-   - Calcula médias por sensor com amostras válidas.
-   - Conecta Wi-Fi, aplica irrigação automática conforme config da API.
-   - Envia médias via `POST /dados` (até 3 tentativas).
-   - Em falha de rede ou upload, persiste JSON na fila LittleFS para retry.
+   - **Durante a irrigação**: a cada `pump_sample_interval_s` e na amostra pós-bomba, enfileira leitura instantânea via `POST /dados`. Falhas vão para a fila LittleFS.
+5. **Lê INA219** (painel e sistema) com Wi-Fi ativo — média de `ina_average_rounds` amostras.
+6. **Aplica irrigação automática** e **envia** o snapshot via `POST /dados` (até 3 tentativas). Em falha, persiste na fila LittleFS.
 7. **Deep sleep** e repete.
 
-### Modo ativo (`DEEP_SLEEP_ENABLED=0`)
+### Modo ativo (`deep_sleep_enabled=false`)
 
 Indicado para bancada, debug ou alimentação contínua (USB/rede). O ESP32 permanece ligado e consome muito mais energia.
 
 1. **Boot único** — inicializa sensores, fila offline e NVS.
-2. A cada `CAPTURE_INTERVAL_SECONDS`:
-   - **Lê sensores** sem Wi-Fi.
-   - **Verifica irrigação manual** (mesmo fluxo do modo deep sleep).
-   - **Aplica irrigação automática** e **envia cada leitura imediatamente** via `POST /dados` (sem agregação por janela).
-   - Tenta drenar a fila offline antes de cada captura, se houver pendências.
-3. **Aguarda** `CAPTURE_INTERVAL_SECONDS` e repete.
+2. A cada `capture_interval_seconds`, executa o **mesmo fluxo de captura** do modo deep sleep (passos 3–6 acima).
+3. Tenta drenar a fila offline antes de cada captura, se houver pendências.
 
-NTP sincroniza relógio; `created_at` nos payloads é enviado em **UTC com sufixo `Z`** (ex.: `2025-06-10T17:30:00Z`). Reenvios offline preservam o timestamp original na fila. Ver `pending_queue.cpp` e constantes `PENDING_*` em `config.h`.
+NTP sincroniza relógio; `created_at` nos payloads é enviado em **UTC com sufixo `Z`** (ex.: `2025-06-10T17:30:00Z`). Reenvios offline preservam o timestamp original na fila.

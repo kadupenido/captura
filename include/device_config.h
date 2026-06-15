@@ -14,7 +14,6 @@ struct DeviceConfig {
   bool deep_sleep_enabled = true;
   int capture_interval_seconds = 30;
   int deep_sleep_seconds = 60;
-  int samples_per_api_upload = 10;
   int http_timeout_ms = 10000;
   int http_max_retries = 3;
   int wifi_timeout_ms = 20000;
@@ -29,6 +28,14 @@ struct DeviceConfig {
   int pending_batch_max_bytes = 16384;
   int pending_max_bytes = 262144;
   int pending_max_lines = 800;
+  float panel_voltage_noise_floor_v = 1.0f;
+  int sensor_average_rounds = 3;
+  int adc_samples = 16;
+  int ina_average_rounds = 5;
+  int ina_sample_delay_ms = 50;
+  int pump_delay_chunk_ms = 500;
+  int http_retry_delay_ms = 2000;
+  bool relay_active_high = true;
   char updated_at[32] = "";
 };
 

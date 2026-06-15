@@ -49,7 +49,6 @@ static bool parseApiBody(const String& body, DeviceConfig& out) {
   parsed.deep_sleep_enabled = doc["deep_sleep_enabled"] | parsed.deep_sleep_enabled;
   parsed.capture_interval_seconds = doc["capture_interval_seconds"] | parsed.capture_interval_seconds;
   parsed.deep_sleep_seconds = doc["deep_sleep_seconds"] | parsed.deep_sleep_seconds;
-  parsed.samples_per_api_upload = doc["samples_per_api_upload"] | parsed.samples_per_api_upload;
   parsed.http_timeout_ms = doc["http_timeout_ms"] | parsed.http_timeout_ms;
   parsed.http_max_retries = doc["http_max_retries"] | parsed.http_max_retries;
   parsed.wifi_timeout_ms = doc["wifi_timeout_ms"] | parsed.wifi_timeout_ms;
@@ -62,6 +61,15 @@ static bool parseApiBody(const String& body, DeviceConfig& out) {
   parsed.pending_batch_max_bytes = doc["pending_batch_max_bytes"] | parsed.pending_batch_max_bytes;
   parsed.pending_max_bytes = doc["pending_max_bytes"] | parsed.pending_max_bytes;
   parsed.pending_max_lines = doc["pending_max_lines"] | parsed.pending_max_lines;
+  parsed.panel_voltage_noise_floor_v =
+      doc["panel_voltage_noise_floor_v"] | parsed.panel_voltage_noise_floor_v;
+  parsed.sensor_average_rounds = doc["sensor_average_rounds"] | parsed.sensor_average_rounds;
+  parsed.adc_samples = doc["adc_samples"] | parsed.adc_samples;
+  parsed.ina_average_rounds = doc["ina_average_rounds"] | parsed.ina_average_rounds;
+  parsed.ina_sample_delay_ms = doc["ina_sample_delay_ms"] | parsed.ina_sample_delay_ms;
+  parsed.pump_delay_chunk_ms = doc["pump_delay_chunk_ms"] | parsed.pump_delay_chunk_ms;
+  parsed.http_retry_delay_ms = doc["http_retry_delay_ms"] | parsed.http_retry_delay_ms;
+  parsed.relay_active_high = doc["relay_active_high"] | parsed.relay_active_high;
 
   const char* ntpPrimary = doc["ntp_server_primary"] | parsed.ntp_server_primary;
   const char* ntpSecondary = doc["ntp_server_secondary"] | parsed.ntp_server_secondary;
@@ -94,7 +102,6 @@ static void saveToNvs(const DeviceConfig& cfg) {
   prefs.putBool("deep_sleep", cfg.deep_sleep_enabled);
   prefs.putInt("cap_int", cfg.capture_interval_seconds);
   prefs.putInt("sleep_s", cfg.deep_sleep_seconds);
-  prefs.putInt("samples", cfg.samples_per_api_upload);
   prefs.putInt("http_to", cfg.http_timeout_ms);
   prefs.putInt("http_ret", cfg.http_max_retries);
   prefs.putInt("wifi_to", cfg.wifi_timeout_ms);
@@ -109,6 +116,14 @@ static void saveToNvs(const DeviceConfig& cfg) {
   prefs.putInt("batch_b", cfg.pending_batch_max_bytes);
   prefs.putInt("pend_b", cfg.pending_max_bytes);
   prefs.putInt("pend_n", cfg.pending_max_lines);
+  prefs.putFloat("pnl_nf", cfg.panel_voltage_noise_floor_v);
+  prefs.putInt("sens_rnd", cfg.sensor_average_rounds);
+  prefs.putInt("adc_n", cfg.adc_samples);
+  prefs.putInt("ina_rnd", cfg.ina_average_rounds);
+  prefs.putInt("ina_dly", cfg.ina_sample_delay_ms);
+  prefs.putInt("pump_chk", cfg.pump_delay_chunk_ms);
+  prefs.putInt("http_rdly", cfg.http_retry_delay_ms);
+  prefs.putBool("relay_hi", cfg.relay_active_high);
   prefs.putString(kNvsUpdatedAt, cfg.updated_at);
   prefs.end();
 }
@@ -138,7 +153,6 @@ static bool loadFromNvs(DeviceConfig& cfg) {
   cfg.deep_sleep_enabled = prefs.getBool("deep_sleep", cfg.deep_sleep_enabled);
   cfg.capture_interval_seconds = prefs.getInt("cap_int", cfg.capture_interval_seconds);
   cfg.deep_sleep_seconds = prefs.getInt("sleep_s", cfg.deep_sleep_seconds);
-  cfg.samples_per_api_upload = prefs.getInt("samples", cfg.samples_per_api_upload);
   cfg.http_timeout_ms = prefs.getInt("http_to", cfg.http_timeout_ms);
   cfg.http_max_retries = prefs.getInt("http_ret", cfg.http_max_retries);
   cfg.wifi_timeout_ms = prefs.getInt("wifi_to", cfg.wifi_timeout_ms);
@@ -157,6 +171,14 @@ static bool loadFromNvs(DeviceConfig& cfg) {
   cfg.pending_batch_max_bytes = prefs.getInt("batch_b", cfg.pending_batch_max_bytes);
   cfg.pending_max_bytes = prefs.getInt("pend_b", cfg.pending_max_bytes);
   cfg.pending_max_lines = prefs.getInt("pend_n", cfg.pending_max_lines);
+  cfg.panel_voltage_noise_floor_v = prefs.getFloat("pnl_nf", cfg.panel_voltage_noise_floor_v);
+  cfg.sensor_average_rounds = prefs.getInt("sens_rnd", cfg.sensor_average_rounds);
+  cfg.adc_samples = prefs.getInt("adc_n", cfg.adc_samples);
+  cfg.ina_average_rounds = prefs.getInt("ina_rnd", cfg.ina_average_rounds);
+  cfg.ina_sample_delay_ms = prefs.getInt("ina_dly", cfg.ina_sample_delay_ms);
+  cfg.pump_delay_chunk_ms = prefs.getInt("pump_chk", cfg.pump_delay_chunk_ms);
+  cfg.http_retry_delay_ms = prefs.getInt("http_rdly", cfg.http_retry_delay_ms);
+  cfg.relay_active_high = prefs.getBool("relay_hi", cfg.relay_active_high);
   copyStringField(cfg.updated_at, sizeof(cfg.updated_at), updatedAt.c_str());
 
   prefs.end();
