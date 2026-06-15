@@ -15,58 +15,21 @@
 #include <Adafruit_INA219.h>
 
 #include "config.h"
+#include "hardware_defaults.h"
+#include "device_config.h"
 #include "log.h"
 #include "pending_queue.h"
 
-#ifndef SAMPLES_PER_API_UPLOAD
-#define SAMPLES_PER_API_UPLOAD 10
-#endif
-
-#ifndef PENDING_BATCH_MAX_ITEMS
-#define PENDING_BATCH_MAX_ITEMS 20
-#endif
-
-#ifndef PENDING_BATCH_MAX_BYTES
-#define PENDING_BATCH_MAX_BYTES 16384
-#endif
-
-#ifndef COLD_BOOT_USB_WAIT_MS
-#define COLD_BOOT_USB_WAIT_MS 2000
-#endif
-
 #ifndef ADC_SAMPLES
 #define ADC_SAMPLES 16
-#endif
-
-#ifndef MANUAL_IRRIGATION_MAX_S
-#define MANUAL_IRRIGATION_MAX_S 600
-#endif
-
-#ifndef PUMP_SAMPLE_INTERVAL_S
-#define PUMP_SAMPLE_INTERVAL_S 10
 #endif
 
 #ifndef PUMP_DELAY_CHUNK_MS
 #define PUMP_DELAY_CHUNK_MS 500
 #endif
 
-#ifndef NTP_SERVER_PRIMARY
-#define NTP_SERVER_PRIMARY "pool.ntp.org"
-#endif
-#ifndef NTP_SERVER_SECONDARY
-#define NTP_SERVER_SECONDARY "time.google.com"
-#endif
-#ifndef NTP_SYNC_WAIT_MS
-#define NTP_SYNC_WAIT_MS 3500
-#endif
-#ifndef NTP_MIN_VALID_YEAR
-#define NTP_MIN_VALID_YEAR 2024
-#endif
-#ifndef NTP_GMT_OFFSET_SEC
-#define NTP_GMT_OFFSET_SEC (-3 * 3600)
-#endif
-#ifndef NTP_DAYLIGHT_OFFSET_SEC
-#define NTP_DAYLIGHT_OFFSET_SEC 0
+#ifndef PAINEL_VOLTAGE_NOISE_FLOOR_V
+#define PAINEL_VOLTAGE_NOISE_FLOOR_V 1.0f
 #endif
 
 #define RTC_MAGIC 0x4D455449  // "METI" meteo dual
@@ -78,26 +41,26 @@ static constexpr float kGasConstantDryAir = 287.05f;
 RTC_DATA_ATTR uint32_t rtc_magic;
 // BME280: somente pressao
 RTC_DATA_ATTR float rtc_sum_press;
-RTC_DATA_ATTR uint8_t rtc_count_press;
+RTC_DATA_ATTR uint16_t rtc_count_press;
 // SHT31: temperatura, umidade (fonte exclusiva)
 RTC_DATA_ATTR float rtc_sum_temp;
 RTC_DATA_ATTR float rtc_sum_hum;
-RTC_DATA_ATTR uint8_t rtc_count_temp_hum;
+RTC_DATA_ATTR uint16_t rtc_count_temp_hum;
 // INA219 painel
 RTC_DATA_ATTR float rtc_sum_vpainel;
 RTC_DATA_ATTR float rtc_sum_ipainel;
 RTC_DATA_ATTR float rtc_sum_ppainel;
-RTC_DATA_ATTR uint8_t rtc_count_painel;
+RTC_DATA_ATTR uint16_t rtc_count_painel;
 // INA219 sistema
 RTC_DATA_ATTR float rtc_sum_vsistema;
 RTC_DATA_ATTR float rtc_sum_isistema;
 RTC_DATA_ATTR float rtc_sum_psistema;
-RTC_DATA_ATTR uint8_t rtc_count_sistema;
+RTC_DATA_ATTR uint16_t rtc_count_sistema;
 // Umidade do solo por zona
 RTC_DATA_ATTR float rtc_sum_soil_1;
 RTC_DATA_ATTR float rtc_sum_soil_2;
-RTC_DATA_ATTR uint8_t rtc_count_soil_1;
-RTC_DATA_ATTR uint8_t rtc_count_soil_2;
+RTC_DATA_ATTR uint16_t rtc_count_soil_1;
+RTC_DATA_ATTR uint16_t rtc_count_soil_2;
 // Total de wakes acumulados na janela
 RTC_DATA_ATTR uint8_t rtc_total_samples;
 // Histerese da irrigacao por zona (persistente entre wakes).
@@ -135,21 +98,53 @@ struct PumpWdtGuard {
 
 static Preferences s_manualPrefs;
 static const char* const kManualPrefsNamespace = "irr_manual";
+static bool s_manualPrefsReady = false;
 
-static bool initManualPrefs() { return s_manualPrefs.begin(kManualPrefsNamespace, false); }
+static bool initManualPrefs() {
+  s_manualPrefsReady = s_manualPrefs.begin(kManualPrefsNamespace, false);
+  return s_manualPrefsReady;
+}
 
 static int32_t loadPersistedLastManualId(int zone) {
+  if (!s_manualPrefsReady) {
+    return 0;
+  }
   const char* key = (zone == 1) ? "last_id_z1" : "last_id_z2";
   return static_cast<int32_t>(s_manualPrefs.getUInt(key, 0));
 }
 
 static void persistLastManualId(int zone, int32_t id) {
-  const char* key = (zone == 1) ? "last_id_z1" : "last_id_z2";
-  s_manualPrefs.putUInt(key, static_cast<uint32_t>(id));
+  if (s_manualPrefsReady) {
+    const char* key = (zone == 1) ? "last_id_z1" : "last_id_z2";
+    s_manualPrefs.putUInt(key, static_cast<uint32_t>(id));
+  }
   if (zone == 1) {
     rtc_last_manual_id_1 = id;
   } else {
     rtc_last_manual_id_2 = id;
+  }
+}
+
+static int loadPersistedLastManualDuration(int zone, int32_t id) {
+  const int32_t persistedId = loadPersistedLastManualId(zone);
+  if (persistedId != id || id <= 0) {
+    return -1;
+  }
+  if (!s_manualPrefsReady) {
+    return -1;
+  }
+  const char* durKey = (zone == 1) ? "last_dur_z1" : "last_dur_z2";
+  return static_cast<int>(s_manualPrefs.getUInt(durKey, 0));
+}
+
+static void persistManualCompletion(int zone, int32_t id, int executedS) {
+  if (executedS < 0) {
+    executedS = 0;
+  }
+  persistLastManualId(zone, id);
+  if (s_manualPrefsReady) {
+    const char* durKey = (zone == 1) ? "last_dur_z1" : "last_dur_z2";
+    s_manualPrefs.putUInt(durKey, static_cast<uint32_t>(executedS));
   }
 }
 
@@ -180,6 +175,48 @@ static void clearActiveManualPump() {
   rtc_active_manual_zone = 0;
   rtc_active_manual_total_s = 0;
   rtc_active_manual_elapsed_s = 0;
+}
+
+static void persistActiveManualState() {
+  if (!s_manualPrefsReady) {
+    return;
+  }
+  s_manualPrefs.putUInt("act_id", static_cast<uint32_t>(rtc_active_manual_id));
+  s_manualPrefs.putUChar("act_zone", rtc_active_manual_zone);
+  s_manualPrefs.putUShort("act_tot", rtc_active_manual_total_s);
+  s_manualPrefs.putUShort("act_elap", rtc_active_manual_elapsed_s);
+}
+
+static void clearPersistedActiveManualState() {
+  if (!s_manualPrefsReady) {
+    return;
+  }
+  s_manualPrefs.remove("act_id");
+  s_manualPrefs.remove("act_zone");
+  s_manualPrefs.remove("act_tot");
+  s_manualPrefs.remove("act_elap");
+}
+
+static bool restorePersistedActiveManualState() {
+  if (!s_manualPrefsReady) {
+    return false;
+  }
+  const int32_t id = static_cast<int32_t>(s_manualPrefs.getUInt("act_id", 0));
+  if (id <= 0) {
+    return false;
+  }
+  const uint8_t zone = s_manualPrefs.getUChar("act_zone", 0);
+  const uint16_t total = s_manualPrefs.getUShort("act_tot", 0);
+  const uint16_t elapsed = s_manualPrefs.getUShort("act_elap", 0);
+  if ((zone != 1 && zone != 2) || total == 0 || elapsed > total) {
+    clearPersistedActiveManualState();
+    return false;
+  }
+  rtc_active_manual_id = id;
+  rtc_active_manual_zone = zone;
+  rtc_active_manual_total_s = total;
+  rtc_active_manual_elapsed_s = elapsed;
+  return true;
 }
 
 static bool s_littlefsOk = false;
@@ -271,8 +308,8 @@ void enterDeepSleep() {
   WiFi.mode(WIFI_OFF);
   Wire.end();
   Wire1.end();
-  esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
-  logPrintf("Entrando em deep sleep por %d segundos...\n", DEEP_SLEEP_SECONDS);
+  esp_sleep_enable_timer_wakeup((uint64_t)deviceConfig().deep_sleep_seconds * 1000000ULL);
+  logPrintf("Entrando em deep sleep por %d segundos...\n", deviceConfig().deep_sleep_seconds);
   Serial.flush();
   delay(50);
   esp_deep_sleep_start();
@@ -292,7 +329,7 @@ bool connectWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_TIMEOUT_MS) {
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < static_cast<unsigned long>(deviceConfig().wifi_timeout_ms)) {
     delay(500);
     Serial.printf(".");
   }
@@ -306,7 +343,7 @@ static bool wallClockLooksSynced() {
   if (!getLocalTime(&t, 50)) {
     return false;
   }
-  return (t.tm_year + 1900) >= NTP_MIN_VALID_YEAR;
+  return (t.tm_year + 1900) >= deviceConfig().ntp_min_valid_year;
 }
 
 static void trySyncTimeFromNtp() {
@@ -316,9 +353,12 @@ static void trySyncTimeFromNtp() {
   if (wallClockLooksSynced()) {
     return;
   }
-  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+  const DeviceConfig& cfg = deviceConfig();
+  configTime(cfg.ntp_gmt_offset_sec, cfg.ntp_daylight_offset_sec, cfg.ntp_server_primary,
+             cfg.ntp_server_secondary);
   const uint32_t start = millis();
-  while (millis() - start < static_cast<uint32_t>(NTP_SYNC_WAIT_MS) && WiFi.status() == WL_CONNECTED) {
+  while (millis() - start < static_cast<uint32_t>(cfg.ntp_sync_wait_ms) &&
+         WiFi.status() == WL_CONNECTED) {
     if (wallClockLooksSynced()) {
       logPrintf("NTP: sincronizado.\n");
       return;
@@ -346,12 +386,14 @@ static void appendCreatedAtUtcIfSynced(JsonDocument& doc) {
 
 bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
+    deviceConfigSyncFromApi();
     trySyncTimeFromNtp();
     return true;
   }
   if (!connectWiFi()) {
     return false;
   }
+  deviceConfigSyncFromApi();
   trySyncTimeFromNtp();
   return true;
 }
@@ -368,7 +410,7 @@ int sendData(const char* payload, size_t payloadLen) {
   snprintf(url, sizeof(url), "%s/dados", API_BASE_URL);
   HTTPClient http;
   http.begin(url);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(deviceConfig().http_timeout_ms);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " API_TOKEN);
 
@@ -386,7 +428,7 @@ int sendBatchData(const char* payload, size_t payloadLen) {
   snprintf(url, sizeof(url), "%s/dados/lote", API_BASE_URL);
   HTTPClient http;
   http.begin(url);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(deviceConfig().http_timeout_ms);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " API_TOKEN);
 
@@ -400,14 +442,14 @@ int sendBatchData(const char* payload, size_t payloadLen) {
 
 int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
   int lastCode = -1;
-  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
-    logPrintf("Envio tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
+  for (int attempt = 1; attempt <= deviceConfig().http_max_retries; attempt++) {
+    logPrintf("Envio tentativa %d/%d...\n", attempt, deviceConfig().http_max_retries);
     lastCode = sendData(payload, payloadLen);
     if (lastCode == 201) {
       logPrintf("Dados enviados com sucesso.\n");
       return 201;
     }
-    if (attempt < HTTP_MAX_RETRIES) {
+    if (attempt < deviceConfig().http_max_retries) {
       delay(2000);
     }
   }
@@ -416,14 +458,14 @@ int sendPayloadWithRetries(const char* payload, size_t payloadLen) {
 
 int sendBatchWithRetries(const char* payload, size_t payloadLen) {
   int lastCode = -1;
-  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
-    logPrintf("Envio lote tentativa %d/%d...\n", attempt, HTTP_MAX_RETRIES);
+  for (int attempt = 1; attempt <= deviceConfig().http_max_retries; attempt++) {
+    logPrintf("Envio lote tentativa %d/%d...\n", attempt, deviceConfig().http_max_retries);
     lastCode = sendBatchData(payload, payloadLen);
     if (lastCode == 201) {
       logPrintf("Lote enviado com sucesso.\n");
       return 201;
     }
-    if (attempt < HTTP_MAX_RETRIES) {
+    if (attempt < deviceConfig().http_max_retries) {
       delay(2000);
     }
   }
@@ -462,7 +504,7 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
 
   HTTPClient http;
   http.begin(url);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(deviceConfig().http_timeout_ms);
   http.addHeader("Authorization", "Bearer " API_TOKEN);
   const int code = http.GET();
   if (code != 200) {
@@ -508,10 +550,13 @@ struct SensorSnapshot {
   float pSistema = NAN;
 };
 
-static SensorSnapshot accumulateSensorSample();
-static void uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly = false);
+static SensorSnapshot accumulateSensorSample(bool includeInWindow = true);
+static bool uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly = false, int irrigS1 = -1,
+                              int irrigS2 = -1);
 static int runPump(int relayPin, int durationS, int32_t manualCmdId = 0, int manualZone = 0,
                    int priorElapsedS = 0);
+static bool finalizeManualCommand(int zone, int32_t id, int executedS, bool clearActiveState = true);
+static void flushPendingQueueWithFallback(const char* context);
 
 struct ManualCommand {
   int32_t id = 0;
@@ -527,7 +572,7 @@ static int fetchPendingManualCommands(ManualCommand out[2]) {
 
   HTTPClient http;
   http.begin(url);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(deviceConfig().http_timeout_ms);
   http.addHeader("Authorization", "Bearer " API_TOKEN);
   const int code = http.GET();
   if (code != 200) {
@@ -580,10 +625,10 @@ static bool startManualCommand(int32_t id) {
   char url[192];
   snprintf(url, sizeof(url), "%s/irrigation/manual/%ld/start", API_BASE_URL, (long)id);
 
-  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+  for (int attempt = 1; attempt <= deviceConfig().http_max_retries; attempt++) {
     HTTPClient http;
     http.begin(url);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setTimeout(deviceConfig().http_timeout_ms);
     http.addHeader("Authorization", "Bearer " API_TOKEN);
     const int code = http.POST(nullptr, 0);
     http.end();
@@ -592,12 +637,13 @@ static bool startManualCommand(int32_t id) {
       return true;
     }
     if (code == 404 || code == 409) {
-      logPrintf("Irrigacao manual: start do comando %ld respondeu %d; tratado como iniciado.\n",
+      logPrintf("Irrigacao manual: start do comando %ld rejeitado (%d); bomba nao sera acionada.\n",
                     (long)id, code);
-      return true;
+      return false;
     }
-    logPrintf("Irrigacao manual: start tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
-    if (attempt < HTTP_MAX_RETRIES) {
+    logPrintf("Irrigacao manual: start tentativa %d/%d falhou (%d).\n", attempt,
+              deviceConfig().http_max_retries, code);
+    if (attempt < deviceConfig().http_max_retries) {
       delay(2000);
     }
   }
@@ -612,10 +658,10 @@ static bool ackManualCommand(int32_t id, int executedS) {
   char body[48];
   snprintf(body, sizeof(body), "{\"executed_duration_s\":%d}", executedS);
 
-  for (int attempt = 1; attempt <= HTTP_MAX_RETRIES; attempt++) {
+  for (int attempt = 1; attempt <= deviceConfig().http_max_retries; attempt++) {
     HTTPClient http;
     http.begin(url);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setTimeout(deviceConfig().http_timeout_ms);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", "Bearer " API_TOKEN);
     const int code = http.POST(reinterpret_cast<uint8_t*>(body), strlen(body));
@@ -629,12 +675,32 @@ static bool ackManualCommand(int32_t id, int executedS) {
                     (long)id, code);
       return true;
     }
-    logPrintf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt, HTTP_MAX_RETRIES, code);
-    if (attempt < HTTP_MAX_RETRIES) {
+    logPrintf("Irrigacao manual: ack tentativa %d/%d falhou (%d).\n", attempt,
+              deviceConfig().http_max_retries, code);
+    if (attempt < deviceConfig().http_max_retries) {
       delay(2000);
     }
   }
   return false;
+}
+
+static bool finalizeManualCommand(int zone, int32_t id, int executedS, bool clearActiveState) {
+  if (zone != 1 && zone != 2) {
+    return false;
+  }
+  if (!ensureWiFi()) {
+    logPrintf("Irrigacao manual: WiFi indisponivel; ack do comando %ld adiado.\n", (long)id);
+    return false;
+  }
+  if (!ackManualCommand(id, executedS)) {
+    return false;
+  }
+  persistManualCompletion(zone, id, executedS);
+  if (clearActiveState) {
+    clearActiveManualPump();
+    clearPersistedActiveManualState();
+  }
+  return true;
 }
 
 static void finishManualCommand(const ManualCommand& cmd, int priorElapsedS, int ranS) {
@@ -673,11 +739,10 @@ static void processManualIrrigation() {
     } else {
       logPrintf("Irrigacao manual: comando %ld (zona %d) ja esgotou duracao; confirmando ack.\n",
                     (long)resumeCmd.id, resumeCmd.zone);
-      if (ensureWiFi()) {
-        ackManualCommand(resumeCmd.id, resumeCmd.durationS);
+      if (!finalizeManualCommand(resumeCmd.zone, resumeCmd.id, rtc_active_manual_elapsed_s, true)) {
+        logPrintf("Irrigacao manual: ack do comando %ld pendente; mantendo estado para retentativa.\n",
+                      (long)resumeCmd.id);
       }
-      persistLastManualId(resumeCmd.zone, resumeCmd.id);
-      clearActiveManualPump();
     }
     return;
   }
@@ -700,20 +765,20 @@ static void processManualIrrigation() {
     if (isManualCommandAlreadyFinished(cmd.zone, cmd.id)) {
       logPrintf("Irrigacao manual: comando %ld (zona %d) ja concluido; reenviando ack.\n",
                     (long)cmd.id, cmd.zone);
-      ensureWiFi();
-      ackManualCommand(cmd.id, cmd.durationS);
+      const int persistedDuration = loadPersistedLastManualDuration(cmd.zone, cmd.id);
+      const int ackDuration = (persistedDuration >= 0) ? persistedDuration : cmd.durationS;
+      finalizeManualCommand(cmd.zone, cmd.id, ackDuration, false);
       continue;
     }
 
     if (isRunning) {
       const bool hasResumeState = (rtc_active_manual_id == cmd.id);
       if (!hasResumeState) {
-        logPrintf(
-            "Irrigacao manual: comando %ld (zona %d) running sem retomada; tratando como concluido.\n",
-            (long)cmd.id, cmd.zone);
-        ensureWiFi();
-        ackManualCommand(cmd.id, cmd.durationS);
-        persistLastManualId(cmd.zone, cmd.id);
+        logPrintf("Irrigacao manual: comando %ld (zona %d) running sem estado RTC; retomando do inicio.\n",
+                      (long)cmd.id, cmd.zone);
+        const int relayPin = (cmd.zone == 1) ? RELAY_PIN_1 : RELAY_PIN_2;
+        const int ranS = runPump(relayPin, cmd.durationS, cmd.id, cmd.zone, 0);
+        finishManualCommand(cmd, 0, ranS);
         continue;
       }
 
@@ -722,10 +787,10 @@ static void processManualIrrigation() {
       if (remaining <= 0) {
         logPrintf("Irrigacao manual: comando %ld (zona %d) ja esgotou duracao; confirmando ack.\n",
                       (long)cmd.id, cmd.zone);
-        ensureWiFi();
-        ackManualCommand(cmd.id, cmd.durationS);
-        persistLastManualId(cmd.zone, cmd.id);
-        clearActiveManualPump();
+        if (!finalizeManualCommand(cmd.zone, cmd.id, rtc_active_manual_elapsed_s, true)) {
+          logPrintf("Irrigacao manual: ack do comando %ld pendente; mantendo estado para retentativa.\n",
+                        (long)cmd.id);
+        }
         continue;
       }
 
@@ -758,19 +823,20 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
   if (durationS <= 0) {
     return 0;
   }
-  if (durationS > MANUAL_IRRIGATION_MAX_S) {
-    durationS = MANUAL_IRRIGATION_MAX_S;
+  const bool trackManual = manualCmdId > 0;
+  if (trackManual && durationS > deviceConfig().manual_irrigation_max_s) {
+    durationS = deviceConfig().manual_irrigation_max_s;
   }
 
-  const bool trackManual = manualCmdId > 0;
   if (trackManual) {
     rtc_active_manual_id = manualCmdId;
     rtc_active_manual_zone = static_cast<uint8_t>(manualZone);
     rtc_active_manual_total_s = static_cast<uint16_t>(priorElapsedS + durationS);
     rtc_active_manual_elapsed_s = static_cast<uint16_t>(priorElapsedS);
+    persistActiveManualState();
   }
 
-  const uint32_t intervalMs = static_cast<uint32_t>(PUMP_SAMPLE_INTERVAL_S) * 1000UL;
+  const uint32_t intervalMs = static_cast<uint32_t>(deviceConfig().pump_sample_interval_s) * 1000UL;
   const uint32_t totalRunMs = static_cast<uint32_t>(durationS) * 1000UL;
   uint32_t remainingMs = totalRunMs;
   {
@@ -789,12 +855,15 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
         remainingMs -= chunk;
         if (trackManual) {
           const uint32_t elapsedRunMs = totalRunMs - remainingMs;
-          rtc_active_manual_elapsed_s =
-              static_cast<uint16_t>(priorElapsedS + elapsedRunMs / 1000UL);
+          const uint16_t elapsedNow = static_cast<uint16_t>(priorElapsedS + elapsedRunMs / 1000UL);
+          if (elapsedNow != rtc_active_manual_elapsed_s) {
+            rtc_active_manual_elapsed_s = elapsedNow;
+            persistActiveManualState();
+          }
         }
       }
       if (remainingMs > 0) {
-        const SensorSnapshot snap = accumulateSensorSample();
+        const SensorSnapshot snap = accumulateSensorSample(false);
         logPrintf("Irrigacao: amostra durante bomba (solo Z1:%.1f%% Z2:%.1f%%, sistema I:%.2f mA)\n",
                       snap.soil1, snap.soil2, snap.inaSistemaReadOk ? snap.iSistema : NAN);
         // Enfileira sem HTTP bloqueante enquanto o rele esta ligado (evita panic no WiFi stack).
@@ -807,26 +876,22 @@ static int runPump(int relayPin, int durationS, int32_t manualCmdId, int manualZ
   if (trackManual) {
     rtc_active_manual_elapsed_s =
         static_cast<uint16_t>(priorElapsedS + durationS);
+    persistActiveManualState();
   }
-  const SensorSnapshot postSnap = accumulateSensorSample();
+  const SensorSnapshot postSnap = accumulateSensorSample(false);
   logPrintf("Irrigacao: amostra pos-bomba (solo Z1:%.1f%% Z2:%.1f%%)\n", postSnap.soil1, postSnap.soil2);
   uploadSnapshotNow(postSnap, true);
 
   if (trackManual) {
     const int totalRan = priorElapsedS + durationS;
-    if (ensureWiFi()) {
-      ackManualCommand(manualCmdId, totalRan);
+    if (!finalizeManualCommand(manualZone, manualCmdId, totalRan, true)) {
+      logPrintf("Irrigacao manual: ack do comando %ld falhou; retomada sera tentada no proximo wake.\n",
+                    (long)manualCmdId);
     }
-    persistLastManualId(manualZone, manualCmdId);
-    clearActiveManualPump();
   }
 
-  if (s_littlefsOk && ensureWiFi()) {
-    const int flushed = pendingQueueFlushBatch(
-        PENDING_BATCH_MAX_ITEMS, PENDING_BATCH_MAX_BYTES, sendBatchWithRetries);
-    if (flushed > 0) {
-      logPrintf("Irrigacao: %d registro(s) enviado(s) da fila (lote).\n", flushed);
-    }
+  if (s_littlefsOk) {
+    flushPendingQueueWithFallback("Irrigacao");
   }
 
   return durationS;
@@ -864,45 +929,53 @@ static float roundTo2(float v) {
   return roundf(v * 100.0f) / 100.0f;
 }
 
-static SensorSnapshot accumulateSensorSample() {
+static SensorSnapshot accumulateSensorSample(bool includeInWindow) {
   SensorSnapshot snap;
 
-  snap.soil1 = readSoilPercent(SOIL_ADC_PIN_1, SOIL1_DRY_MV, SOIL1_WET_MV);
-  snap.soil2 = readSoilPercent(SOIL_ADC_PIN_2, SOIL2_DRY_MV, SOIL2_WET_MV);
-  if (!isnan(snap.soil1)) {
+  const DeviceConfig& cfg = deviceConfig();
+  snap.soil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
+  snap.soil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+  if (includeInWindow && !isnan(snap.soil1)) {
     rtc_sum_soil_1 += snap.soil1;
     rtc_count_soil_1++;
   }
-  if (!isnan(snap.soil2)) {
+  if (includeInWindow && !isnan(snap.soil2)) {
     rtc_sum_soil_2 += snap.soil2;
     rtc_count_soil_2++;
-  }
-
-  if (s_bmeOk) {
-    bme.takeForcedMeasurement();
-    const float pLocalBme = bme.readPressure() / 100.0F;
-    if (!isnan(pLocalBme)) {
-      const float tempRefC = (rtc_count_temp_hum > 0) ? (rtc_sum_temp / rtc_count_temp_hum) : 25.0f;
-      const float tKelvin = tempRefC + 273.15f;
-      snap.pSeaBme = pLocalBme * expf((kGravity * (float)ALTITUDE_LOCAL) / (kGasConstantDryAir * tKelvin));
-      rtc_sum_press += snap.pSeaBme;
-      rtc_count_press++;
-      snap.bmeReadOk = true;
-    } else {
-      logPrintf("Leitura invalida do BME280 (NaN).\n");
-    }
   }
 
   if (s_shtOk) {
     snap.temperatura = sht31.readTemperature();
     snap.umidade = sht31.readHumidity();
     if (!isnan(snap.temperatura) && !isnan(snap.umidade)) {
-      rtc_sum_temp += snap.temperatura;
-      rtc_sum_hum += snap.umidade;
-      rtc_count_temp_hum++;
+      if (includeInWindow) {
+        rtc_sum_temp += snap.temperatura;
+        rtc_sum_hum += snap.umidade;
+        rtc_count_temp_hum++;
+      }
       snap.shtReadOk = true;
     } else {
       logPrintf("Leitura invalida do SHT31 (NaN).\n");
+    }
+  }
+
+  if (s_bmeOk) {
+    bme.takeForcedMeasurement();
+    const float pLocalBme = bme.readPressure() / 100.0F;
+    if (!isnan(pLocalBme)) {
+      const float tempRefC = snap.shtReadOk
+          ? snap.temperatura
+          : ((rtc_count_temp_hum > 0) ? (rtc_sum_temp / rtc_count_temp_hum) : 25.0f);
+      const float tKelvin = tempRefC + 273.15f;
+      snap.pSeaBme = pLocalBme * expf((kGravity * static_cast<float>(deviceConfig().altitude_local)) /
+                                      (kGasConstantDryAir * tKelvin));
+      if (includeInWindow) {
+        rtc_sum_press += snap.pSeaBme;
+        rtc_count_press++;
+      }
+      snap.bmeReadOk = true;
+    } else {
+      logPrintf("Leitura invalida do BME280 (NaN).\n");
     }
   }
 
@@ -910,13 +983,16 @@ static SensorSnapshot accumulateSensorSample() {
     snap.vPainel = inaPainel.getBusVoltage_V();
     snap.iPainel = inaPainel.getCurrent_mA();
     snap.pPainel = inaPainel.getPower_mW();
+    if (snap.vPainel < PAINEL_VOLTAGE_NOISE_FLOOR_V) snap.vPainel = 0.0f;
     if (snap.iPainel < 0.0f) snap.iPainel = 0.0f;
     if (snap.pPainel < 0.0f) snap.pPainel = 0.0f;
     if (!isnan(snap.vPainel) && !isnan(snap.iPainel) && !isnan(snap.pPainel)) {
-      rtc_sum_vpainel += snap.vPainel;
-      rtc_sum_ipainel += snap.iPainel;
-      rtc_sum_ppainel += snap.pPainel;
-      rtc_count_painel++;
+      if (includeInWindow) {
+        rtc_sum_vpainel += snap.vPainel;
+        rtc_sum_ipainel += snap.iPainel;
+        rtc_sum_ppainel += snap.pPainel;
+        rtc_count_painel++;
+      }
       snap.inaPainelReadOk = true;
     } else {
       logPrintf("Leitura invalida do INA219 painel (NaN).\n");
@@ -926,11 +1002,15 @@ static SensorSnapshot accumulateSensorSample() {
     snap.vSistema = inaSistema.getBusVoltage_V();
     snap.iSistema = inaSistema.getCurrent_mA();
     snap.pSistema = inaSistema.getPower_mW();
+    if (snap.iSistema < 0.0f) snap.iSistema = 0.0f;
+    if (snap.pSistema < 0.0f) snap.pSistema = 0.0f;
     if (!isnan(snap.vSistema) && !isnan(snap.iSistema) && !isnan(snap.pSistema)) {
-      rtc_sum_vsistema += snap.vSistema;
-      rtc_sum_isistema += snap.iSistema;
-      rtc_sum_psistema += snap.pSistema;
-      rtc_count_sistema++;
+      if (includeInWindow) {
+        rtc_sum_vsistema += snap.vSistema;
+        rtc_sum_isistema += snap.iSistema;
+        rtc_sum_psistema += snap.pSistema;
+        rtc_count_sistema++;
+      }
       snap.inaSistemaReadOk = true;
     } else {
       logPrintf("Leitura invalida do INA219 sistema (NaN).\n");
@@ -976,10 +1056,16 @@ static void enqueueSnapshotPayload(const char* payload) {
   }
 }
 
-static void uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly) {
+static bool uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly, int irrigS1, int irrigS2) {
   JsonDocument doc;
   if (!appendSnapshotToJson(snap, doc)) {
-    return;
+    return false;
+  }
+  if (irrigS1 >= 0) {
+    doc["tempo_irrigacao_s_1"] = irrigS1;
+  }
+  if (irrigS2 >= 0) {
+    doc["tempo_irrigacao_s_2"] = irrigS2;
   }
   appendCreatedAtUtcIfSynced(doc);
 
@@ -987,24 +1073,97 @@ static void uploadSnapshotNow(const SensorSnapshot& snap, bool queueOnly) {
   const size_t n = serializeJson(doc, payload, sizeof(payload));
   if (n == 0 || n >= sizeof(payload)) {
     logPrintf("Erro: JSON snapshot excede buffer ou serializacao falhou.\n");
-    return;
+    return false;
   }
 
   if (queueOnly) {
     enqueueSnapshotPayload(payload);
-    return;
+    return s_littlefsOk;
   }
 
   if (!ensureWiFi()) {
     logPrintf("Irrigacao: WiFi indisponivel; gravando snapshot na fila local.\n");
     enqueueSnapshotPayload(payload);
-    return;
+    return s_littlefsOk;
   }
 
-  if (sendPayloadWithRetries(payload, n) != 201) {
-    logPrintf("Irrigacao: falha ao enviar snapshot; gravando na fila local.\n");
-    enqueueSnapshotPayload(payload);
+  if (sendPayloadWithRetries(payload, n) == 201) {
+    return true;
   }
+  logPrintf("Irrigacao: falha ao enviar snapshot; gravando na fila local.\n");
+  enqueueSnapshotPayload(payload);
+  return s_littlefsOk;
+}
+
+static void flushPendingQueueWithFallback(const char* context) {
+  if (!s_littlefsOk || !pendingQueueHasPending()) {
+    return;
+  }
+  if (!ensureWiFi()) {
+    return;
+  }
+  const int flushed = pendingQueueFlushBatch(deviceConfig().pending_batch_max_items,
+                                             deviceConfig().pending_batch_max_bytes, sendBatchWithRetries);
+  if (flushed > 0) {
+    logPrintf("%s: %d registro(s) enviado(s) da fila (lote).\n", context, flushed);
+    return;
+  }
+  if (flushed == -422) {
+    logPrintf("%s: lote rejeitado com 422; tentando envio unitario da fila.\n", context);
+    const int singleFlushed =
+        pendingQueueFlush(deviceConfig().pending_batch_max_items, sendPayloadWithRetriesForQueue);
+    if (singleFlushed > 0) {
+      logPrintf("%s: %d registro(s) enviado(s) da fila (unitario).\n", context, singleFlushed);
+    }
+  }
+}
+
+void runActiveCycle() {
+  const SensorSnapshot snap = accumulateSensorSample(false);
+
+  logPrintf("P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
+                snap.bmeReadOk ? snap.pSeaBme : NAN,
+                snap.shtReadOk ? snap.temperatura : NAN,
+                snap.shtReadOk ? snap.umidade : NAN,
+                snap.inaPainelReadOk ? snap.vPainel : NAN,
+                snap.inaPainelReadOk ? snap.iPainel : NAN,
+                snap.inaPainelReadOk ? snap.pPainel : NAN,
+                snap.inaSistemaReadOk ? snap.vSistema : NAN,
+                snap.inaSistemaReadOk ? snap.iSistema : NAN,
+                snap.inaSistemaReadOk ? snap.pSistema : NAN);
+  logPrintf("Solo Z1:%.1f%% Z2:%.1f%%\n", snap.soil1, snap.soil2);
+
+  processManualIrrigation();
+
+  int irrigationSeconds1 = rtc_manual_irrig_s_1;
+  int irrigationSeconds2 = rtc_manual_irrig_s_2;
+
+  if (ensureWiFi()) {
+    IrrigationConfig irrigationCfg {};
+    if (fetchIrrigationConfig(irrigationCfg)) {
+      const DeviceConfig& cfg = deviceConfig();
+      const float freshSoil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
+      const float freshSoil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+      const float soilDecision1 = !isnan(freshSoil1) ? freshSoil1 : snap.soil1;
+      const float soilDecision2 = !isnan(freshSoil2) ? freshSoil2 : snap.soil2;
+      irrigationSeconds1 += maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1,
+                                              rtc_irrigation_armed_1);
+      irrigationSeconds2 += maybeIrrigateZone(RELAY_PIN_2, soilDecision2, irrigationCfg.zone2,
+                                              rtc_irrigation_armed_2);
+    } else {
+      logPrintf("Irrigacao: mantendo bombas desligadas por falta de configuracao.\n");
+    }
+    setRelayState(RELAY_PIN_1, false);
+    setRelayState(RELAY_PIN_2, false);
+  }
+
+  const bool persisted = uploadSnapshotNow(snap, false, irrigationSeconds1, irrigationSeconds2);
+  if (persisted) {
+    rtc_manual_irrig_s_1 = 0;
+    rtc_manual_irrig_s_2 = 0;
+  }
+
+  wifiOffIfConnected();
 }
 
 void runCycle() {
@@ -1013,7 +1172,7 @@ void runCycle() {
   rtc_total_samples++;
 
   logPrintf("[%d/%d] P:%.2f | T:%.2f U:%.2f | Painel V:%.2f I:%.2f P:%.2f | Sistema V:%.2f I:%.2f P:%.2f\n",
-                rtc_total_samples, (int)SAMPLES_PER_API_UPLOAD,
+                rtc_total_samples, deviceConfig().samples_per_api_upload,
                 snap.bmeReadOk ? snap.pSeaBme : NAN,
                 snap.shtReadOk ? snap.temperatura : NAN,
                 snap.shtReadOk ? snap.umidade : NAN,
@@ -1028,7 +1187,7 @@ void runCycle() {
   // Comandos manuais sao verificados em todo wake (apos leituras de ADC/sensores).
   processManualIrrigation();
 
-  if (rtc_total_samples < SAMPLES_PER_API_UPLOAD) {
+  if (rtc_total_samples < deviceConfig().samples_per_api_upload) {
     wifiOffIfConnected();
     return;
   }
@@ -1082,16 +1241,23 @@ void runCycle() {
     if (nOffline == 0 || nOffline >= sizeof(payloadOffline)) {
       logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
       wifiOffIfConnected();
-      resetRtcWindow();
       return;
     }
-    if (s_littlefsOk && !pendingQueueAppend(payloadOffline)) {
-      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
-    } else if (!s_littlefsOk) {
+    bool persisted = false;
+    if (s_littlefsOk) {
+      persisted = pendingQueueAppend(payloadOffline);
+      if (!persisted) {
+        logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+      }
+    } else {
       logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
     wifiOffIfConnected();
-    resetRtcWindow();
+    if (persisted) {
+      resetRtcWindow();
+    } else {
+      logPrintf("Janela mantida para retentativa no proximo wake.\n");
+    }
     return;
   }
   logPrintf("WiFi conectado.\n");
@@ -1100,11 +1266,14 @@ void runCycle() {
   int irrigationSeconds2 = 0;
   IrrigationConfig irrigationCfg {};
   if (fetchIrrigationConfig(irrigationCfg)) {
-    const float soilDecision1 = !isnan(snap.soil1)
-        ? snap.soil1
+    const DeviceConfig& cfg = deviceConfig();
+    const float freshSoil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
+    const float freshSoil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+    const float soilDecision1 = !isnan(freshSoil1)
+        ? freshSoil1
         : (rtc_count_soil_1 > 0 ? (rtc_sum_soil_1 / rtc_count_soil_1) : NAN);
-    const float soilDecision2 = !isnan(snap.soil2)
-        ? snap.soil2
+    const float soilDecision2 = !isnan(freshSoil2)
+        ? freshSoil2
         : (rtc_count_soil_2 > 0 ? (rtc_sum_soil_2 / rtc_count_soil_2) : NAN);
     irrigationSeconds1 = maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1, rtc_irrigation_armed_1);
     irrigationSeconds2 = maybeIrrigateZone(RELAY_PIN_2, soilDecision2, irrigationCfg.zone2, rtc_irrigation_armed_2);
@@ -1123,24 +1292,36 @@ void runCycle() {
   if (n == 0 || n >= sizeof(payload)) {
     logPrintf("Erro: JSON excede buffer ou serializacao falhou.\n");
     wifiOffIfConnected();
-    resetRtcWindow();
+    logPrintf("Janela mantida para retentativa no proximo wake.\n");
     return;
   }
 
-  if (sendPayloadWithRetries(payload, n) != 201) {
+  bool persisted = false;
+  if (sendPayloadWithRetries(payload, n) == 201) {
+    persisted = true;
+  } else {
     logPrintf("Falha ao enviar dados apos todas as tentativas; gravando na fila local.\n");
-    if (s_littlefsOk && !pendingQueueAppend(payload)) {
-      logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
-    } else if (!s_littlefsOk) {
+    if (s_littlefsOk) {
+      persisted = pendingQueueAppend(payload);
+      if (!persisted) {
+        logPrintf("Fila local: falha ao gravar (LittleFS cheio ou erro).\n");
+      }
+    } else {
       logPrintf("Fila local: LittleFS indisponivel; dados desta janela nao salvos.\n");
     }
   }
 
   wifiOffIfConnected();
-  resetRtcWindow();
+  if (persisted) {
+    resetRtcWindow();
+  } else {
+    logPrintf("Janela mantida para retentativa no proximo wake.\n");
+  }
 }
 
 void setup() {
+  deviceConfigLoadNvs();
+
   Serial.begin(115200);
 
   const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
@@ -1148,9 +1329,9 @@ void setup() {
 
   // Boot a frio: espera breve pelo host USB-CDC para nao perder logs iniciais.
   // Wake de timer (campo): sem espera — evita ~10 s de CPU ativa a cada acordar.
-  if (coldBoot && COLD_BOOT_USB_WAIT_MS > 0) {
+  if (coldBoot && deviceConfig().cold_boot_usb_wait_ms > 0) {
     uint32_t waited = 0;
-    while (!Serial && waited < static_cast<uint32_t>(COLD_BOOT_USB_WAIT_MS)) {
+    while (!Serial && waited < static_cast<uint32_t>(deviceConfig().cold_boot_usb_wait_ms)) {
       delay(50);
       waited += 50;
     }
@@ -1198,9 +1379,12 @@ void setup() {
   }
 
   if (!s_bmeOk && !s_shtOk && !s_inaPainelOk && !s_inaSistemaOk) {
-    logPrintf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
-    enterDeepSleep();
-    return;
+    if (deviceConfig().deep_sleep_enabled) {
+      logPrintf("Nenhum sensor I2C disponivel. Voltando a dormir.\n");
+      enterDeepSleep();
+      return;
+    }
+    logPrintf("Aviso: nenhum sensor I2C disponivel; leituras de solo ADC continuam no modo ativo.\n");
   }
 
   if (!initManualPrefs()) {
@@ -1214,10 +1398,13 @@ void setup() {
     rtc_last_manual_id_1 = 0;
     rtc_last_manual_id_2 = 0;
     syncManualIdsFromNvsIfNeeded();
-    clearActiveManualPump();
+    if (!restorePersistedActiveManualState()) {
+      clearActiveManualPump();
+    }
   } else {
     if (rtc_irrigation_armed_1 > 1) rtc_irrigation_armed_1 = 1;
     if (rtc_irrigation_armed_2 > 1) rtc_irrigation_armed_2 = 1;
+    restorePersistedActiveManualState();
   }
 
   if (!s_littlefsOk) {
@@ -1230,19 +1417,12 @@ void setup() {
       logPrintf("Fila offline: itens pendentes; tentando enviar...\n");
     }
     if (ensureWiFi()) {
-      int n = pendingQueueFlushBatch(
-          PENDING_BATCH_MAX_ITEMS, PENDING_BATCH_MAX_BYTES, sendBatchWithRetries);
+      flushPendingQueueWithFallback("Fila");
       int remaining = pendingQueueCount();
       if (remaining < 0) {
         remaining = pendingQueueHasPending() ? -1 : 0;
       }
-      if (n > 0) {
-        if (remaining >= 0) {
-          logPrintf("Fila: lote enviado (%d registro(s)); restam %d.\n", n, remaining);
-        } else {
-          logPrintf("Fila: lote enviado (%d registro(s)).\n", n);
-        }
-      } else if (remaining > 0) {
+      if (remaining > 0) {
         logPrintf("Fila: nada enviado; restam %d.\n", remaining);
       }
     } else {
@@ -1256,10 +1436,26 @@ void setup() {
   // O envio da fila pode ter ligado o WiFi; desliga antes de seguir o ciclo.
   wifiOffIfConnected();
 
-  runCycle();
-
-  enterDeepSleep();
+  if (deviceConfig().deep_sleep_enabled) {
+    logPrintf("Modo: deep sleep (%d s entre wakes)\n", deviceConfig().deep_sleep_seconds);
+    runCycle();
+    enterDeepSleep();
+  } else {
+    logPrintf("Modo: ativo (captura a cada %d s)\n", deviceConfig().capture_interval_seconds);
+    runActiveCycle();
+  }
 }
 
 void loop() {
+  if (deviceConfig().deep_sleep_enabled) {
+    return;
+  }
+  delay(static_cast<uint32_t>(deviceConfig().capture_interval_seconds) * 1000UL);
+  if (s_littlefsOk && pendingQueueHasPending()) {
+    if (ensureWiFi()) {
+      flushPendingQueueWithFallback("Fila");
+    }
+    wifiOffIfConnected();
+  }
+  runActiveCycle();
 }

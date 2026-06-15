@@ -34,7 +34,7 @@ void logPrintf(const char* fmt, ...) {
   formatLogPrefix(prefix, sizeof(prefix));
   Serial.print(prefix);
 
-  char body[256];
+  char body[512];
   va_list args;
   va_start(args, fmt);
   vsnprintf(body, sizeof(body), fmt, args);

@@ -1,4 +1,6 @@
 Diretório de headers do firmware.
 
-- **`config.example.h`** — template de configuração (Wi-Fi, API, pinos, calibração). Copie para `config.h` e edite; `config.h` está no `.gitignore`.
+- **`config.example.h`** — template de rede e API. Copie para `config.h` e edite; `config.h` está no `.gitignore`.
+- **`hardware_defaults.h`** — pinos I2C/ADC/relés fixos no firmware.
+- **`device_config.h`** — configurações operacionais sincronizadas da API (NVS + painel web).
 - Demais headers do projeto são incluídos a partir de `src/` com `#include "..."`.

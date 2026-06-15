@@ -4,21 +4,8 @@
 #include <cstring>
 #include <sys/stat.h>
 
-#include "config.h"
+#include "device_config.h"
 #include "log.h"
-
-#ifndef PENDING_MAX_BYTES
-#define PENDING_MAX_BYTES 262144
-#endif
-#ifndef PENDING_MAX_LINES
-#define PENDING_MAX_LINES 800
-#endif
-#ifndef PENDING_BATCH_MAX_ITEMS
-#define PENDING_BATCH_MAX_ITEMS 20
-#endif
-#ifndef PENDING_BATCH_MAX_BYTES
-#define PENDING_BATCH_MAX_BYTES 16384
-#endif
 
 static const char* const kPendingPath = "/pending.ndjson";
 static const char* const kPendingTmp = "/pending.tmp";
@@ -32,6 +19,33 @@ static const char kPendingTmpVfs[] = "/littlefs/pending.tmp";
 // Contagem de linhas nao vazias; reidratado uma vez em pendingQueueInit().
 static int s_pendingLineCount = 0;
 static bool s_lineCountValid = false;
+
+static int mergeTmpIntoPending() {
+  File tmp = LittleFS.open(kPendingTmp, "r");
+  if (!tmp) {
+    return 0;
+  }
+  File pending = LittleFS.open(kPendingPath, "a", true);
+  if (!pending) {
+    tmp.close();
+    return -1;
+  }
+
+  int merged = 0;
+  while (tmp.available()) {
+    String line = tmp.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      continue;
+    }
+    pending.println(line);
+    merged++;
+  }
+  pending.close();
+  tmp.close();
+  LittleFS.remove(kPendingTmp);
+  return merged;
+}
 
 static size_t pendingFileSize() {
   struct stat st;
@@ -122,8 +136,9 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
     }
   }
 
-  while (s_lineCountValid && s_pendingLineCount >= PENDING_MAX_LINES) {
-    logPrintf("Fila: descartando linha mais antiga (limite %d linhas).\n", (int)PENDING_MAX_LINES);
+  while (s_lineCountValid && s_pendingLineCount >= deviceConfig().pending_max_lines) {
+    logPrintf("Fila: descartando linha mais antiga (limite %d linhas).\n",
+              deviceConfig().pending_max_lines);
     if (!removeFirstLine()) {
       return false;
     }
@@ -132,10 +147,11 @@ static bool pendingQueueAppendBytes(const char* data, size_t lineLen) {
   while (true) {
     size_t fsz = pendingFileSize();
     size_t add = lineLen + (fsz > 0 ? 1 : 0);
-    if (fsz + add <= (size_t)PENDING_MAX_BYTES) {
+    if (fsz + add <= static_cast<size_t>(deviceConfig().pending_max_bytes)) {
       break;
     }
-    logPrintf("Fila: descartando linha mais antiga (limite %d bytes).\n", (int)PENDING_MAX_BYTES);
+    logPrintf("Fila: descartando linha mais antiga (limite %d bytes).\n",
+              deviceConfig().pending_max_bytes);
     if (!removeFirstLine()) {
       return false;
     }
@@ -162,8 +178,13 @@ bool pendingQueueInit() {
   s_lineCountValid = false;
   s_pendingLineCount = 0;
 
-  if (!LittleFS.begin(false)) {
-    logPrintf("LittleFS: montagem falhou, formatando...\n");
+  bool mounted = LittleFS.begin(false);
+  if (!mounted) {
+    delay(50);
+    mounted = LittleFS.begin(false);
+  }
+  if (!mounted) {
+    logPrintf("LittleFS: montagem falhou; tentando formatar...\n");
     if (!LittleFS.begin(true)) {
       logPrintf("LittleFS: formatacao falhou.\n");
       return false;
@@ -172,7 +193,14 @@ bool pendingQueueInit() {
 
   struct stat st;
   if (stat(kPendingTmpVfs, &st) == 0) {
-    LittleFS.remove(kPendingTmp);
+    const int merged = mergeTmpIntoPending();
+    if (merged > 0) {
+      logPrintf("Fila offline: recuperados %d item(ns) de pending.tmp.\n", merged);
+    } else if (merged == 0) {
+      LittleFS.remove(kPendingTmp);
+    } else {
+      logPrintf("Fila offline: falha ao recuperar pending.tmp.\n");
+    }
   }
 
   // Garante ficheiro da fila sem usar exists() (evita log de erro no VFS).
@@ -302,8 +330,12 @@ int pendingQueueFlushBatch(int maxItems, size_t maxBytes, PendingBatchSendFn sen
       if (batchCount == 0) {
         if (line.length() + 2 > maxBytes) {
           in.close();
-          logPrintf("Fila: registro excede tamanho maximo do lote (%u bytes).\n", (unsigned)maxBytes);
-          return 0;
+          logPrintf("Fila: registro excede tamanho maximo do lote (%u bytes); descartando.\n",
+                    (unsigned)maxBytes);
+          if (!removeFirstLine()) {
+            return 0;
+          }
+          return pendingQueueFlushBatch(maxItems, maxBytes, send);
         }
         batchLines[batchCount++] = line;
         batchBytes += add;
@@ -333,8 +365,12 @@ int pendingQueueFlushBatch(int maxItems, size_t maxBytes, PendingBatchSendFn sen
   }
   payload += "]";
 
-  if (send(payload.c_str(), payload.length()) != 201) {
+  const int code = send(payload.c_str(), payload.length());
+  if (code != 201) {
     in.close();
+    if (code == 422) {
+      return -422;
+    }
     return 0;
   }
 
