@@ -232,13 +232,28 @@ static float readAdcMilliVoltsAvg(int pin) {
   return static_cast<float>(accumMv) / static_cast<float>(valid);
 }
 
-static float readSoilPercent(int pin, float dryMv, float wetMv) {
-  float mv = readAdcMilliVoltsAvg(pin);
-  if (isnan(mv) || fabsf(wetMv - dryMv) < 1.0f) {
+static float readAdcRawAvg(int pin) {
+  uint32_t accumRaw = 0;
+  int valid = 0;
+  for (int i = 0; i < deviceConfig().adc_samples; i++) {
+    accumRaw += static_cast<uint32_t>(analogRead(pin));
+    valid++;
+    delayMicroseconds(200);
+  }
+  if (valid == 0) {
     return NAN;
   }
-  const float pct = ((mv - dryMv) / (wetMv - dryMv)) * 100.0f;
-  return clampPct(pct);
+  return static_cast<float>(accumRaw) / static_cast<float>(valid);
+}
+
+static void readSoilReading(int pin, float dryMv, float wetMv, float& outRaw, float& outPct) {
+  outRaw = readAdcRawAvg(pin);
+  const float mv = readAdcMilliVoltsAvg(pin);
+  if (isnan(mv) || fabsf(wetMv - dryMv) < 1.0f) {
+    outPct = NAN;
+    return;
+  }
+  outPct = clampPct(((mv - dryMv) / (wetMv - dryMv)) * 100.0f);
 }
 
 void resetRtcState() {
@@ -481,6 +496,8 @@ static bool fetchIrrigationConfig(IrrigationConfig& cfg) {
 struct SensorSnapshot {
   float soil1 = NAN;
   float soil2 = NAN;
+  float soilAdc1 = NAN;
+  float soilAdc2 = NAN;
   bool bmeReadOk = false;
   bool shtReadOk = false;
   bool inaPainelReadOk = false;
@@ -883,8 +900,8 @@ static SensorSnapshot captureInstantSnapshot() {
   SensorSnapshot snap;
   const DeviceConfig& cfg = deviceConfig();
 
-  snap.soil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
-  snap.soil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+  readSoilReading(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv, snap.soilAdc1, snap.soil1);
+  readSoilReading(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv, snap.soilAdc2, snap.soil2);
 
   if (s_shtOk) {
     snap.temperatura = sht31.readTemperature();
@@ -939,8 +956,12 @@ static SensorSnapshot captureAmbientSnapshot() {
 
   float sumSoil1 = 0.0F;
   float sumSoil2 = 0.0F;
+  float sumSoilAdc1 = 0.0F;
+  float sumSoilAdc2 = 0.0F;
   uint16_t countSoil1 = 0;
   uint16_t countSoil2 = 0;
+  uint16_t countSoilAdc1 = 0;
+  uint16_t countSoilAdc2 = 0;
   float sumTemp = 0.0F;
   float sumHum = 0.0F;
   uint16_t countTempHum = 0;
@@ -948,8 +969,12 @@ static SensorSnapshot captureAmbientSnapshot() {
   uint16_t countPress = 0;
 
   for (int round = 0; round < cfg.sensor_average_rounds; round++) {
-    const float soil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
-    const float soil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+    float soil1 = NAN;
+    float soil2 = NAN;
+    float soilAdc1 = NAN;
+    float soilAdc2 = NAN;
+    readSoilReading(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv, soilAdc1, soil1);
+    readSoilReading(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv, soilAdc2, soil2);
     if (!isnan(soil1)) {
       sumSoil1 += soil1;
       countSoil1++;
@@ -957,6 +982,14 @@ static SensorSnapshot captureAmbientSnapshot() {
     if (!isnan(soil2)) {
       sumSoil2 += soil2;
       countSoil2++;
+    }
+    if (!isnan(soilAdc1)) {
+      sumSoilAdc1 += soilAdc1;
+      countSoilAdc1++;
+    }
+    if (!isnan(soilAdc2)) {
+      sumSoilAdc2 += soilAdc2;
+      countSoilAdc2++;
     }
 
     if (s_shtOk) {
@@ -992,6 +1025,12 @@ static SensorSnapshot captureAmbientSnapshot() {
   }
   if (countSoil2 > 0) {
     snap.soil2 = sumSoil2 / static_cast<float>(countSoil2);
+  }
+  if (countSoilAdc1 > 0) {
+    snap.soilAdc1 = sumSoilAdc1 / static_cast<float>(countSoilAdc1);
+  }
+  if (countSoilAdc2 > 0) {
+    snap.soilAdc2 = sumSoilAdc2 / static_cast<float>(countSoilAdc2);
   }
   if (countTempHum > 0) {
     snap.temperatura = sumTemp / static_cast<float>(countTempHum);
@@ -1101,6 +1140,12 @@ static bool appendSnapshotToJson(const SensorSnapshot& snap, JsonDocument& doc) 
   if (!isnan(snap.soil2)) {
     doc["umidade_solo_2"] = roundTo2(snap.soil2);
   }
+  if (!isnan(snap.soilAdc1)) {
+    doc["adc_solo_1"] = static_cast<int>(lroundf(snap.soilAdc1));
+  }
+  if (!isnan(snap.soilAdc2)) {
+    doc["adc_solo_2"] = static_cast<int>(lroundf(snap.soilAdc2));
+  }
   return doc.size() > 0;
 }
 
@@ -1208,8 +1253,11 @@ static void runCaptureCycle() {
     IrrigationConfig irrigationCfg {};
     if (fetchIrrigationConfig(irrigationCfg)) {
       const DeviceConfig& cfg = deviceConfig();
-      const float freshSoil1 = readSoilPercent(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv);
-      const float freshSoil2 = readSoilPercent(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv);
+      float discardRaw = NAN;
+      float freshSoil1 = NAN;
+      float freshSoil2 = NAN;
+      readSoilReading(SOIL_ADC_PIN_1, cfg.soil1_dry_mv, cfg.soil1_wet_mv, discardRaw, freshSoil1);
+      readSoilReading(SOIL_ADC_PIN_2, cfg.soil2_dry_mv, cfg.soil2_wet_mv, discardRaw, freshSoil2);
       const float soilDecision1 = !isnan(freshSoil1) ? freshSoil1 : snap.soil1;
       const float soilDecision2 = !isnan(freshSoil2) ? freshSoil2 : snap.soil2;
       irrigationSeconds1 += maybeIrrigateZone(RELAY_PIN_1, soilDecision1, irrigationCfg.zone1,

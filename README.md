@@ -85,6 +85,8 @@ Campos opcionais (graceful degradation — sensores com falha no ciclo são omit
   "pressao": 1013.25,
   "umidade_solo_1": 42.0,
   "umidade_solo_2": 38.5,
+  "adc_solo_1": 1850,
+  "adc_solo_2": 1920,
   "tensao_painel": 5.83,
   "corrente_painel": 0.12,
   "potencia_painel": 0.70,
